@@ -22,7 +22,14 @@ import statistics
 import tempfile
 
 import fitz
-from ocrmac import ocrmac
+
+# Lazy import of ``ocrmac`` — see ``quire/extract/refine.py`` for the
+# rationale. Linux / Windows installs without ocrmac can still import
+# this module and use the Tesseract or text engines.
+try:
+    from ocrmac import ocrmac  # type: ignore[import-not-found]
+except ImportError:
+    ocrmac = None  # type: ignore[assignment]
 
 ARABIC_RE = re.compile(r"[\u0600-\u06ff\ufb50-\ufdff\ufe70-\ufeff]")
 
@@ -45,6 +52,13 @@ def _bbox_to_pdf(bbox, img_w_pt: float, img_h_pt: float) -> tuple[float, float, 
 
 
 def vision_pass(image_path: str, langs: list[str]) -> list[dict]:
+    if ocrmac is None:
+        raise ImportError(
+            "The Vision OCR engine requires the optional 'ocrmac' package, "
+            "which is macOS-only. Install with `pip install quire[vision]` "
+            "on macOS, or set `engine = \"tesseract\"` / `engine = \"text\"` "
+            "in your book.toml."
+        )
     result = ocrmac.OCR(
         image_path,
         recognition_level="accurate",

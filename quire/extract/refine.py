@@ -16,8 +16,18 @@ import statistics
 import tempfile
 
 import fitz
-from ocrmac import ocrmac
 from PIL import Image
+
+# ``ocrmac`` is the macOS Vision binding and only installs on macOS. Import
+# lazily so that ``quire.pipeline`` and ``quire.render.audit`` (which both
+# import this module) remain usable on Linux / Windows with the Tesseract
+# or text-layer engines. The actual ``ocrmac.OCR`` call inside
+# :func:`_vision_pass` raises ``ImportError`` only if a build with
+# ``engine = "vision"`` is started on a host without ocrmac installed.
+try:
+    from ocrmac import ocrmac  # type: ignore[import-not-found]
+except ImportError:
+    ocrmac = None  # type: ignore[assignment]
 
 ARABIC_RE = re.compile(r"[\u0600-\u06ff\ufb50-\ufdff\ufe70-\ufeff]")
 
@@ -36,6 +46,13 @@ def arabic_dominant(text: str) -> bool:
 
 def _vision_pass(image_path: str, langs: list[str], *, retries: int) -> list:
     """Run Vision OCR with retry on transient failures."""
+    if ocrmac is None:
+        raise ImportError(
+            "The Vision OCR engine requires the optional 'ocrmac' package, "
+            "which is macOS-only. Install with `pip install quire[vision]` "
+            "on macOS, or set `engine = \"tesseract\"` / `engine = \"text\"` "
+            "in your book.toml."
+        )
     last_exc: Exception | None = None
     for attempt in range(max(1, retries + 1)):
         try:
