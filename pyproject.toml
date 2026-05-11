@@ -1,0 +1,121 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quire"
+version = "0.1.0"
+description = "Quire — CLI pipeline for OCR/text PDF conversion to EPUB, HTML, Markdown, and text with multi-script review workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Quire authors" }]
+
+dependencies = [
+    "PyMuPDF>=1.23",
+    "pyspellchecker>=0.7",
+    "pillow>=10.0",
+    "tomli>=2.0; python_version<'3.11'",
+]
+
+[project.optional-dependencies]
+vision = ["ocrmac>=1.0"]      # macOS Vision OCR engine (Apple SDK)
+tesseract = ["pytesseract>=0.3.10"]  # cross-platform Tesseract 5 binding
+test = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytesseract>=0.3.10",
+]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5.0",
+    "mypy>=1.8",
+    "pytesseract>=0.3.10",
+]
+all = ["ocrmac>=1.0", "pytesseract>=0.3.10"]
+
+[project.scripts]
+quire = "quire.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quire*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",   # long lines (handled by formatter where possible)
+    "E741",   # "ambiguous" var names like `l`, `L` are intentional in line-loops
+    "B008",   # function-call-in-default
+    "B028",   # warnings.warn without stacklevel — fine here
+    "B904",   # `raise ... from e` is encouraged but not required
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401", "B007"]
+"quire/postprocess/canonical/quran.py" = ["E501"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = ["-ra", "--strict-markers"]
+testpaths = ["tests"]
+markers = [
+    "vision: tests that require macOS Vision OCR (ocrmac)",
+    "slow: longer integration tests",
+]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+# Conservative starter config: validate the public surface (config, io_utils,
+# context, models, batch, logging_utils, epubcheck, script_utils) where most
+# user-facing contracts live, while leaving the deep PDF-structure heuristics
+# (extract/, structure/, render/chapters.py) untyped for now. We will tighten
+# the include list as those modules are refactored.
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+ignore_missing_imports = true
+follow_imports = "silent"
+strict_optional = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+allow_redefinition = true
+check_untyped_defs = false
+disable_error_code = ["misc"]
+
+[[tool.mypy.overrides]]
+module = [
+    "quire.config",
+    "quire.io_utils",
+    "quire.context",
+    "quire.models",
+    "quire.batch",
+    "quire.logging_utils",
+    "quire.epubcheck",
+    "quire.script_utils",
+    "quire.extract.ocr_engine",
+]
+disallow_untyped_defs = true
+
+# Heavy / heuristic-laden modules stay loose for now; revisit per refactor.
+[[tool.mypy.overrides]]
+module = [
+    "quire.structure.*",
+    "quire.extract.refine",
+    "quire.render.chapters",
+    "quire.render.package",
+]
+ignore_errors = true
