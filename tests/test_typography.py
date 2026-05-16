@@ -16,6 +16,7 @@ from quire.render.typography import (
     apply_qc_fix,
     apply_typography_fixes,
     build_vocab,
+    collapse_repetition_runs,
     convert_loose_footnote_digits,
     html_to_plain,
     load_qc_fixes,
@@ -444,6 +445,105 @@ class TestApplyTypographyFixes:
         )
         assert rep.qc_no_op_entries == ["missing find string"]
         assert rep.qc_tag_skipped_entries == []
+
+
+# ---------- collapse_repetition_runs ----------
+
+class TestCollapseRepetitionRuns:
+    """The OCR / structuring pipeline occasionally multiplies a single
+    token hundreds of times. This is structurally impossible in
+    well-formed prose, so the transform can collapse aggressively
+    without risking false positives. Test both the firing patterns and
+    the no-op contract for things that *look* like runs but aren't."""
+
+    def test_word_run_collapses_to_single(self) -> None:
+        html = "as shown by the" + (" term" * 200) + " content"
+        out, examples = collapse_repetition_runs(html)
+        assert " term term" not in out
+        assert "as shown by the term content" in out
+        assert examples
+        assert "200x" in examples[0]
+
+    def test_paren_run_collapses_to_one(self) -> None:
+        html = "before " + ("(" * 200) + " after"
+        out, examples = collapse_repetition_runs(html)
+        assert "((" not in out
+        assert "before ( after" in out
+        assert examples
+
+    def test_dot_run_becomes_ellipsis(self) -> None:
+        html = "greatness" + ("." * 203) + " 58"
+        out, examples = collapse_repetition_runs(html)
+        assert "..." not in out
+        assert "greatness\u2026 58" in out
+        assert examples
+
+    def test_apostrophe_run_dropped(self) -> None:
+        html = "Spirit" + ("'" * 200) + "<a>fn</a>"
+        out, examples = collapse_repetition_runs(html)
+        assert "''" not in out
+        assert "Spirit<a>fn</a>" in out
+        assert examples
+
+    def test_hyphen_run_collapses(self) -> None:
+        html = "before " + ("-" * 50) + " after"
+        out, _ = collapse_repetition_runs(html)
+        assert "--" not in out
+        assert "before - after" in out
+
+    def test_quote_run_dropped(self) -> None:
+        html = 'word' + ('"' * 30) + "next"
+        out, _ = collapse_repetition_runs(html)
+        assert '""' not in out
+        assert "wordnext" in out
+
+    def test_short_word_repeats_left_alone(self) -> None:
+        # Five repeats — below threshold (10) — must be preserved.
+        html = "term term term term term"
+        out, examples = collapse_repetition_runs(html)
+        assert out == html
+        assert examples == []
+
+    def test_short_dot_run_preserved(self) -> None:
+        # Three dots (intentional ellipsis) — below threshold (8).
+        html = "fragment... continues"
+        out, _ = collapse_repetition_runs(html)
+        assert out == html
+
+    def test_em_dash_pair_preserved(self) -> None:
+        # Two em-dashes — below 8-rep threshold.
+        html = "phrase -- continues"
+        out, _ = collapse_repetition_runs(html)
+        assert out == html
+
+    def test_html_metachars_not_collapsed(self) -> None:
+        # `<<<<<<<<` would be an HTML mistake but we don't touch it;
+        # the threshold regex excludes `<`, `>`, `&` to avoid breaking
+        # well-formed markup that happens to contain repeated metas
+        # inside CDATA / scripts (none in EPUB output, but be safe).
+        html = "<p>a</p>"
+        out, _ = collapse_repetition_runs(html)
+        assert out == html
+
+    def test_arabic_word_repeats_collapse(self) -> None:
+        # Arabic transliteration / Quranic words can hit the same
+        # pathology. The token charset includes Latin diacritics +
+        # Arabic Unicode block.
+        html = "phrase" + (" tamattu" * 15) + " end"
+        out, examples = collapse_repetition_runs(html)
+        assert " tamattu tamattu" not in out
+        assert "phrase tamattu end" in out
+        assert examples
+
+    def test_does_not_break_inline_tags(self) -> None:
+        # Repeated tokens around an em-tag should not introduce
+        # HTML breakage even when one repetition starts in plain text.
+        # The transform is text-only; the em-tag is preserved verbatim.
+        html = "<em>tamattu</em>" + ("'" * 200) + "<sup>1</sup>"
+        out, _ = collapse_repetition_runs(html)
+        # The 200 apostrophes between em and sup are gone; the tag pair
+        # is intact.
+        assert "<em>tamattu</em><sup>1</sup>" in out
 
 
 # ---------- regression: must not break valid HTML ----------

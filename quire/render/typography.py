@@ -536,6 +536,8 @@ class TypographyReport:
     hyphen_examples: list[str] = field(default_factory=list)
     footnote_digits: int = 0
     quote_strips: int = 0
+    run_collapses: int = 0
+    run_collapse_examples: list[str] = field(default_factory=list)
 
     def summary_line(self) -> str:
         parts = []
@@ -551,9 +553,106 @@ class TypographyReport:
             parts.append(f"{self.footnote_digits} footnote-digit normalization(s)")
         if self.quote_strips:
             parts.append(f"{self.quote_strips} stray-quote strip(s)")
+        if self.run_collapses:
+            parts.append(f"{self.run_collapses} repetition-run collapse(s)")
         if not parts:
             return "no typography fixes applied"
         return "typography: " + ", ".join(parts)
+
+
+# Thresholds chosen so that legitimate prose never trips the transform:
+# - 10+ identical whole-word tokens in a row never appears in real
+#   English / Arabic prose; the bar is set low because the OCR
+#   pathology that creates these runs always overshoots into the
+#   hundreds.
+# - 8+ identical single non-word characters covers `((((((`, `''''''`,
+#   `------`, `....` runs of length 8+ — anything shorter is
+#   plausibly a normal ellipsis variant or a stylistic dash.
+_RUN_WORD_MIN_REPS = 10
+_RUN_CHAR_MIN_REPS = 8
+
+# Runs of dots / commas collapse to a Unicode ellipsis (citation gap
+# semantics preserved). Other character classes collapse to a single
+# instance.
+_RUN_TO_ELLIPSIS = set(".,")
+_RUN_ALWAYS_DROP = set("'\"")
+
+# Word-run regex: a non-whitespace, non-tag token followed by 10+ space-
+# separated repetitions of itself. Anchored with `\B?` to also catch
+# leading-space cases like ` term term term…`. The token must start with
+# a word char so we don't capture punctuation streaks here — those are
+# handled by the single-char regex below.
+_RUN_WORD_RE = re.compile(
+    rf"(?P<lead> ?)(?P<tok>[A-Za-z\u00c0-\u024f\u0600-\u06ff'\u2018\u2019\-]{{1,30}})"
+    rf"(?:[ \t]+(?P=tok)){{{_RUN_WORD_MIN_REPS - 1},}}"
+)
+
+# Single-character run regex: any single non-word char (excluding space
+# and HTML metacharacters `<` / `>` / `&`) repeated 8+ times.
+_RUN_CHAR_RE = re.compile(
+    rf"(?P<ch>[^A-Za-z0-9\s<>&])(?P=ch){{{_RUN_CHAR_MIN_REPS - 1},}}"
+)
+
+
+def collapse_repetition_runs(html: str) -> tuple[str, list[str]]:
+    """Collapse pathological repetition runs left over from OCR / structuring.
+
+    Some scanned PDFs surface a single token multiplied dozens or
+    hundreds of times: ``term term term term …`` (200×),
+    ``( ( ( ( ( …`` (200×), ``...........`` (200+ dots), etc. These
+    runs are never the author's intent — they are a structural
+    pathology — and they slip past the small find/replace layers
+    because their exact length varies between rebuilds.
+
+    Rules:
+
+    * A 1- to 30-char word-shaped token (Latin / Arabic / hyphenated)
+      separated by whitespace and repeated ``_RUN_WORD_MIN_REPS`` (10)+
+      times collapses to a single instance.
+    * A single non-word character (excluding whitespace and HTML
+      metacharacters ``<``, ``>``, ``&``) repeated ``_RUN_CHAR_MIN_REPS``
+      (8)+ times collapses to:
+
+      - ``…`` (Unicode ellipsis) for ``.`` or ``,`` runs (citation
+        gap semantics);
+      - empty string for ``'``, ``"`` runs (stray apostrophe / quote
+        garbage);
+      - a single occurrence otherwise (``(``, ``-``, ``)`` etc.).
+
+    The transform is intentionally conservative: it only fires on
+    runs that are structurally impossible in well-formed prose, so
+    legitimate em-dash patterns, ellipses, and stylistic punctuation
+    are never touched.
+
+    Returns ``(new_html, examples)`` where ``examples`` is a short
+    list of human-readable descriptions of each collapse for audit
+    logging (e.g. ``"200x ' term' -> ' term'"``).
+    """
+    examples: list[str] = []
+
+    def _word_repl(m: re.Match[str]) -> str:
+        tok = m.group("tok")
+        lead = m.group("lead")
+        full = m.group(0)
+        reps = full.count(tok)
+        examples.append(f"{reps}x {tok!r} -> single")
+        return f"{lead}{tok}"
+
+    def _char_repl(m: re.Match[str]) -> str:
+        ch = m.group("ch")
+        reps = len(m.group(0))
+        if ch in _RUN_TO_ELLIPSIS:
+            replacement = "\u2026"
+        elif ch in _RUN_ALWAYS_DROP:
+            replacement = ""
+        else:
+            replacement = ch
+        examples.append(f"{reps}x {ch!r} -> {replacement!r}")
+        return replacement
+
+    new_html = _RUN_WORD_RE.sub(_word_repl, html)
+    new_html = _RUN_CHAR_RE.sub(_char_repl, new_html)
+    return new_html, examples
 
 
 def apply_typography_fixes(
@@ -613,6 +712,11 @@ def apply_typography_fixes(
                     applied_this_pass = True
             if not applied_this_pass:
                 break
+
+        new_html, run_examples = collapse_repetition_runs(new_html)
+        if run_examples:
+            rep.run_collapses += len(run_examples)
+            rep.run_collapse_examples.extend(run_examples[:5])
 
         new_html, hfixes = stitch_hyphens(new_html, vocab)
         rep.hyphen_stitches += len(hfixes)

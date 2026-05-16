@@ -1361,6 +1361,9 @@ def _build_book_with_doc(
         if typo_report.hyphen_examples:
             for ex in typo_report.hyphen_examples[:5]:
                 log(f"    hyphen: {ex}")
+        if typo_report.run_collapse_examples:
+            for ex in typo_report.run_collapse_examples[:5]:
+                log(f"    run-collapse: {ex}")
         if typo_report.qc_tag_skipped_entries:
             log(
                 "  qc_fixes.toml: "
