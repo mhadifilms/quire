@@ -21,10 +21,12 @@ dependencies = [
 [project.optional-dependencies]
 vision = ["ocrmac>=1.0"]      # macOS Vision OCR engine (Apple SDK)
 tesseract = ["pytesseract>=0.3.10"]  # cross-platform Tesseract 5 binding
+qc = ["httpx>=0.27"]          # AI-assisted QC via Gemini Vision (quire/qc/)
 test = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "pytesseract>=0.3.10",
+    "httpx>=0.27",
 ]
 dev = [
     "pytest>=7.4",
@@ -32,8 +34,9 @@ dev = [
     "ruff>=0.5.0",
     "mypy>=1.8",
     "pytesseract>=0.3.10",
+    "httpx>=0.27",
 ]
-all = ["ocrmac>=1.0", "pytesseract>=0.3.10"]
+all = ["ocrmac>=1.0", "pytesseract>=0.3.10", "httpx>=0.27"]
 
 [project.scripts]
 quire = "quire.cli:main"

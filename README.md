@@ -25,6 +25,9 @@ outputs with:
   optional EPUBCheck integration.
 - Batch processing with bounded parallelism, per-book status manifests, and
   partial-failure isolation.
+- Optional AI-assisted QC via Gemini Vision: compares each page image to
+  its extracted text and merges validated corrections into the book's
+  `qc_fixes.toml` (see [AI-assisted QC](#ai-assisted-qc-optional)).
 
 ## Layout
 
@@ -287,6 +290,90 @@ quire batch --manifest batch.toml --workers 4 --status batch-status.json
 The batch runner isolates per-book failures, writes a JSON status file, and
 exits non-zero when any book fails (configurable with `--fail-fast` or
 `--continue-on-error`).
+
+## AI-assisted QC (optional)
+
+Quire ships an opt-in proofreading stage that compares each rendered page
+image to the extracted page text using a Vision-Language Model (Gemini
+2.5 Flash by default) and proposes corrections. Validated find/replace
+pairs are merged into `<book_dir>/qc_fixes.toml`, which the post-render
+typography stage already applies on the next build.
+
+### Setup
+
+1. Install the optional dependency:
+
+   ```bash
+   pip install -e ".[qc]"   # or include qc in your existing extras
+   ```
+
+2. Get a Gemini API key from <https://aistudio.google.com/apikey> and export
+   it (either name works):
+
+   ```bash
+   export GEMINI_API_KEY=...   # preferred
+   # or: export GOOGLE_API_KEY=...
+   ```
+
+3. Add a `[qc]` section to the book's `book.toml`:
+
+   ```toml
+   [qc]
+   enabled = true
+   engine = "gemini-2.5-flash"     # or "gemini-2.5-flash-lite" for cheaper runs
+   dpi = 200
+   concurrency = 4
+   max_cost_usd = 1.0              # hard cap; run aborts on overshoot
+   retry = 2
+   min_confidence = "medium"       # accepts "high" | "medium" | "low"
+   pages = "all"                   # or "1-50" or "3,18,105"
+   preserve_human = true           # human qc_fixes.toml entries are never overwritten
+   ```
+
+### Running QC
+
+- **Inside `quire build`**: with `enabled = true`, every build performs a
+  QC pass before applying typography fixes. Corrections written this run
+  are applied to the same build's EPUB.
+
+- **Standalone**: write corrections without producing an EPUB:
+
+  ```bash
+  quire qc <book> --dry-run                          # estimate cost only
+  quire qc <book> --pages 1-50 --max-cost-usd 0.50   # subset run with cap
+  quire qc <book> --engine gemini-2.5-flash-lite     # cheaper model
+  quire qc <book> --force                            # ignore the response cache
+  ```
+
+  After a QC run, rerun `quire build <book>` to apply the new corrections.
+
+### Cost expectations
+
+Gemini 2.5 Flash currently costs $0.30 / 1M input tokens and $2.50 / 1M
+output tokens. In practice that works out to roughly:
+
+- ~$0.0005 per page on average
+- ~$0.08 per 161-page book
+- ~$80 per 1,000 books
+
+The `max_cost_usd` setting is a hard cap. The runner aborts (writing
+partial corrections) if the running total exceeds it. Use `--dry-run` to
+preview cost before committing.
+
+### Caching
+
+Per-page responses are cached at
+`books/<slug>/artifacts/caches/qc/<key>.json`, keyed by
+`(model, image_sha256, page_text_sha256)`. Repeat runs skip pages whose
+inputs have not changed. Use `--force` to bypass the cache.
+
+### Privacy
+
+When QC is enabled, page images and extracted text leave your machine
+and are sent to Google's Gemini API. Per Google's terms, free-tier
+data may be used for product improvement; paid-tier data is not used
+for training. Leave the `[qc]` section out of `book.toml` (or set
+`enabled = false`) to run fully offline.
 
 ## Adding a new language
 

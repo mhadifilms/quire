@@ -28,11 +28,36 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 SUPPORTED_OCR_ENGINES = {"vision", "tesseract", "text", "pdf", "pymupdf"}
 SUPPORTED_FORMATS = {"epub", "html", "markdown", "md", "text", "txt"}
+SUPPORTED_QC_ENGINES = {
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+}
+SUPPORTED_QC_CONFIDENCES = {"high", "medium", "low"}
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 
 
 class BookConfigError(ValueError):
     """Raised for malformed or invalid ``book.toml``."""
+
+
+@dataclass
+class QCSettings:
+    """Resolved ``[qc]`` configuration for AI-assisted QC.
+
+    See :mod:`quire.qc` for the full pipeline and
+    ``README.md`` for setup instructions (API key, cost, privacy).
+    """
+
+    enabled: bool = False
+    engine: str = "gemini-2.5-flash"
+    dpi: int = 200
+    concurrency: int = 4
+    max_cost_usd: float = 1.0
+    retry: int = 2
+    min_confidence: str = "medium"
+    pages: str = "all"
+    preserve_human: bool = True
 
 
 @dataclass
@@ -64,6 +89,7 @@ class BookConfig:
     epub_filename: str
     output_formats: list[str]
     raw: dict[str, Any]
+    qc_settings: QCSettings | None = None
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -174,6 +200,7 @@ def load_book_config(book_dir: str | Path, *, repo_root: Path | None = None) -> 
     pp = cfg.get("postprocess", {})
     struct = cfg.get("structure", {})
     rd = cfg.get("render", {})
+    qc = cfg.get("qc", {})
 
     slug = str(book.get("slug") or book_dir.name)
     if not _SLUG_RE.match(slug):
@@ -264,6 +291,8 @@ def load_book_config(book_dir: str | Path, *, repo_root: Path | None = None) -> 
             f"{fonts_dir}: {missing_fonts}"
         )
 
+    qc_settings = _load_qc_settings(qc) if qc else None
+
     epub_filename = rd.get("epub_filename") or f"{slug}.epub"
     output_formats = [str(f).lower() for f in rd.get("formats", ["epub"])]
     invalid_formats = sorted(set(output_formats) - SUPPORTED_FORMATS)
@@ -302,7 +331,58 @@ def load_book_config(book_dir: str | Path, *, repo_root: Path | None = None) -> 
         epub_filename=epub_filename,
         output_formats=output_formats,
         raw=cfg,
+        qc_settings=qc_settings,
         warnings=warnings,
+    )
+
+
+def _load_qc_settings(qc: dict[str, Any]) -> QCSettings:
+    """Parse and validate the ``[qc]`` table.
+
+    Missing keys take the dataclass defaults; unknown engines or
+    confidence levels raise :class:`BookConfigError`.
+    """
+    enabled = bool(qc.get("enabled", False))
+    engine = str(qc.get("engine", "gemini-2.5-flash")).lower()
+    if engine not in SUPPORTED_QC_ENGINES:
+        raise BookConfigError(
+            f"unsupported qc.engine {engine!r}. "
+            f"Supported: {sorted(SUPPORTED_QC_ENGINES)}"
+        )
+    dpi = int(qc.get("dpi", 200))
+    if dpi < 72 or dpi > 600:
+        raise BookConfigError(f"qc.dpi must be between 72 and 600, got {dpi}")
+    concurrency = int(qc.get("concurrency", 4))
+    if concurrency < 1 or concurrency > 32:
+        raise BookConfigError(f"qc.concurrency must be 1..32, got {concurrency}")
+    max_cost_usd = float(qc.get("max_cost_usd", 1.0))
+    if max_cost_usd < 0:
+        raise BookConfigError(f"qc.max_cost_usd must be >= 0, got {max_cost_usd}")
+    retry = int(qc.get("retry", 2))
+    if retry < 0 or retry > 10:
+        raise BookConfigError(f"qc.retry must be 0..10, got {retry}")
+    min_confidence = str(qc.get("min_confidence", "medium")).lower()
+    if min_confidence not in SUPPORTED_QC_CONFIDENCES:
+        raise BookConfigError(
+            f"unsupported qc.min_confidence {min_confidence!r}. "
+            f"Supported: {sorted(SUPPORTED_QC_CONFIDENCES)}"
+        )
+    pages_value = qc.get("pages", "all")
+    if isinstance(pages_value, list):
+        pages = ",".join(str(int(x)) for x in pages_value)
+    else:
+        pages = str(pages_value)
+    preserve_human = bool(qc.get("preserve_human", True))
+    return QCSettings(
+        enabled=enabled,
+        engine=engine,
+        dpi=dpi,
+        concurrency=concurrency,
+        max_cost_usd=max_cost_usd,
+        retry=retry,
+        min_confidence=min_confidence,
+        pages=pages,
+        preserve_human=preserve_human,
     )
 
 

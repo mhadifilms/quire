@@ -73,6 +73,74 @@ def _cmd_render_pages(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_qc(args: argparse.Namespace) -> int:
+    """Run AI-assisted page-by-page QC against the rendered EPUB content.
+
+    Operates on the rendered chapter XHTML produced by the previous
+    ``quire build`` run. If no rendered chapters exist yet, renders
+    them in-memory without writing an EPUB.
+    """
+    import dataclasses as _dc
+
+    from .config import QCSettings
+    from .pipeline import (
+        _build_rendered_chapters_for_qc,  # type: ignore[attr-defined]
+    )
+    from .qc import run_qc
+    from .qc.page_text import build_page_map, extract_page_texts
+    from .qc.runner import parse_page_spec
+
+    book_dir = find_book_dir(REPO_ROOT, args.book)
+    cfg = load_book_config(book_dir, repo_root=REPO_ROOT)
+    cfg.ensure_artifact_dirs()
+
+    settings = cfg.qc_settings or QCSettings(enabled=True)
+    overrides: dict[str, object] = {"enabled": True}
+    if args.engine:
+        overrides["engine"] = args.engine
+    if args.dpi is not None:
+        overrides["dpi"] = args.dpi
+    if args.concurrency is not None:
+        overrides["concurrency"] = args.concurrency
+    if args.max_cost_usd is not None:
+        overrides["max_cost_usd"] = args.max_cost_usd
+    if args.min_confidence is not None:
+        overrides["min_confidence"] = args.min_confidence
+    if args.pages is not None:
+        overrides["pages"] = args.pages
+    cfg.qc_settings = _dc.replace(settings, **overrides)  # type: ignore[arg-type]
+
+    print(
+        f"[quire qc] book={cfg.slug} model={cfg.qc_settings.engine} "
+        f"dpi={cfg.qc_settings.dpi} concurrency={cfg.qc_settings.concurrency} "
+        f"max_cost_usd={cfg.qc_settings.max_cost_usd}",
+        file=sys.stderr,
+    )
+
+    rendered, chapters = _build_rendered_chapters_for_qc(cfg)
+    page_map = build_page_map(chapters)
+    page_texts = extract_page_texts(rendered, page_map)
+
+    available = {pt.pdf_pno for pt in page_texts}
+    try:
+        pages_filter = parse_page_spec(cfg.qc_settings.pages, available=available)
+    except ValueError as e:
+        print(f"[quire qc] bad --pages: {e}", file=sys.stderr)
+        return 2
+
+    result = run_qc(
+        cfg,
+        page_texts=page_texts,
+        pages_filter=pages_filter,
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+    print(f"[quire qc] {result.summary_line()}", file=sys.stderr)
+    if result.aborted:
+        return 1
+    return 0
+
+
 def _cmd_batch(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -156,6 +224,42 @@ def main(argv: list[str] | None = None) -> int:
     p_render.add_argument("book", help="Book slug or folder path.")
     p_render.add_argument("--dpi", type=int, default=160)
     p_render.set_defaults(func=_cmd_render_pages)
+
+    p_qc = sub.add_parser(
+        "qc",
+        help="Run AI-assisted page-by-page QC and merge corrections into qc_fixes.toml.",
+    )
+    p_qc.add_argument("book", help="Book slug or folder path.")
+    p_qc.add_argument(
+        "--pages",
+        default=None,
+        help="Page range like '1-50' or '3,18,105' (default: all).",
+    )
+    p_qc.add_argument(
+        "--engine", default=None,
+        help="Override [qc].engine, e.g. gemini-2.5-flash-lite.",
+    )
+    p_qc.add_argument("--dpi", type=int, default=None)
+    p_qc.add_argument("--concurrency", type=int, default=None)
+    p_qc.add_argument("--max-cost-usd", type=float, default=None, dest="max_cost_usd")
+    p_qc.add_argument(
+        "--min-confidence",
+        choices=["high", "medium", "low"],
+        default=None,
+        dest="min_confidence",
+    )
+    p_qc.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Estimate cost and exit without calling the model.",
+    )
+    p_qc.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore the per-page response cache and re-call for every page.",
+    )
+    p_qc.set_defaults(func=_cmd_qc)
 
     p_batch = sub.add_parser("batch", help="Build many books from a manifest.")
     p_batch.add_argument("--manifest", required=True,

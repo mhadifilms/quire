@@ -1089,6 +1089,100 @@ def _merge_cross_page_paragraphs(ocr_pages: list[dict]) -> None:
         log(f"  merged {merged} cross-page paragraphs")
 
 
+def _structure_and_assemble(cfg: BookConfig, *, pdf_doc, pages, ocr_pages):
+    """Run structure + post-processors + chapter assembly.
+
+    Shared between ``build_book`` and the standalone ``quire qc`` path
+    so both produce identical chapter objects from the same OCR cache.
+    """
+    body_size = estimate_global_body_size(pages)
+    engine = cfg.ocr_engine.lower()
+    pp_registry.run_pre_structure(cfg, ocr_pages)
+    if engine in {"text", "pdf", "pymupdf"}:
+        for i, op in enumerate(ocr_pages):
+            op["elements"] = structure_page_text(pages[i], [], body_size)
+    elif engine in {"vision", "tesseract"}:
+        for i, op in enumerate(ocr_pages):
+            op["pno"] = i + 1
+            op.setdefault("printed_page", pages[i].get("printed_page"))
+            op["elements"] = structure_page_vision(
+                pdf_doc[i], op, body_size, heuristics=cfg.book_heuristics,
+            )
+    _merge_cross_page_paragraphs(ocr_pages)
+    pp_registry.run_post_structure(cfg, ocr_pages)
+    return assemble_chapters(pages, ocr_pages, pdf_doc, cfg=cfg)
+
+
+def _build_rendered_chapters_for_qc(cfg: BookConfig):
+    """Re-run only the steps needed to produce ``(rendered, chapters)``.
+
+    Used by the standalone ``quire qc`` CLI when no in-memory build
+    context exists. Re-uses OCR / structure caches so a typical
+    invocation only does chapter assembly + chapter rendering.
+    """
+    cfg.ensure_artifact_dirs()
+    reset_for_build(cfg)
+    ocr_corrections.reset_report()
+
+    log("extracting PDF text layer with PyMuPDF")
+    pdf_doc, pages = extract_all(str(cfg.pdf_path))
+    try:
+        ocr_pages = _run_engine(cfg, pages, force=False, retry_failed=False)
+        if len(ocr_pages) != len(pages):
+            raise RuntimeError(
+                f"page count mismatch: PDF has {len(pages)} pages but OCR returned {len(ocr_pages)} pages"
+            )
+        chapters = _structure_and_assemble(
+            cfg, pdf_doc=pdf_doc, pages=pages, ocr_pages=ocr_pages,
+        )
+        rendered: list[tuple[str, str]] = []
+        for c in chapters:
+            xhtml, _emitted = render_chapter(c, all_chapters=chapters, cfg=cfg)
+            rendered.append((c.slug, xhtml))
+    finally:
+        try:
+            pdf_doc.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return rendered, chapters
+
+
+def _maybe_run_qc(
+    cfg: BookConfig,
+    *,
+    rendered: list[tuple[str, str]],
+    chapters,
+) -> None:
+    """Auto-run AI QC when ``[qc] enabled = true`` in book.toml.
+
+    The QC stage is intentionally a soft dependency: if it fails (no
+    API key, network error, etc.) we log and continue with the build
+    rather than abort. Corrections it writes are picked up by the
+    next ``load_qc_fixes`` call in the build flow.
+    """
+    settings = cfg.qc_settings
+    if settings is None or not settings.enabled:
+        return
+    try:
+        from .qc import run_qc
+        from .qc.page_text import build_page_map, extract_page_texts
+    except ImportError as e:
+        log(f"qc: skipped (import error: {e})")
+        return
+    try:
+        page_map = build_page_map(chapters)
+        page_texts = extract_page_texts(rendered, page_map)
+        if not page_texts:
+            log("qc: no page texts found; skipped")
+            return
+        log(f"qc: running on {len(page_texts)} page(s) via {settings.engine}")
+        result = run_qc(cfg, page_texts=page_texts)
+        log(f"  {result.summary_line()}")
+    except Exception as e:
+        log(f"qc: failed ({e}); continuing build without AI corrections")
+        log_event("qc_pipeline_error", slug=cfg.slug, error=str(e))
+
+
 def render_page_images(cfg: BookConfig, dpi: int = 160) -> int:
     """Render every PDF page as PNG into the book's artifact image cache."""
     out = cfg.page_images_dir
@@ -1239,6 +1333,14 @@ def _build_book_with_doc(
             rendered.append((c.slug, xhtml))
             emitted_pp_total |= emitted
         log(f"  {len(emitted_pp_total)} unique printed-page anchors")
+
+        # 8b. Optional AI-assisted QC.
+        # When [qc] enabled = true in book.toml, send each rendered
+        # page image + extracted text to a VLM (Gemini by default) and
+        # merge validated find/replace corrections into qc_fixes.toml.
+        # Those corrections are then consumed by the typography stage
+        # right below. See quire/qc/ for the full implementation.
+        _maybe_run_qc(cfg, rendered=rendered, chapters=chapters)
 
         # 9. Post-render typography fixes.
         # These operate on the rendered XHTML, where OCR / typesetting
