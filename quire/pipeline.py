@@ -28,6 +28,7 @@ from .postprocess import ocr_corrections
 from .postprocess import registry as pp_registry
 from .render.chapters import assemble_chapters, render_chapter
 from .render.export import write_exports
+from .render.overrides import apply_chapter_overrides
 from .render.package import build_epub, render_cover_jpeg
 from .render.typography import (
     apply_typography_fixes,
@@ -1378,6 +1379,29 @@ def _build_book_with_doc(
                 count=len(typo_report.qc_no_op_entries),
                 examples=typo_report.qc_no_op_entries[:10],
             )
+
+        # 9b. Per-book chapter overrides.
+        # Author-provided XHTML files in books/<slug>/chapter_overrides/
+        # replace the corresponding rendered chapter wholesale. This is
+        # the escape hatch for chapters whose OCR is too corrupt to
+        # recover via small find/replace fixes (multi-column tables,
+        # glossaries, indexes). See quire.render.overrides.
+        rendered, override_report = apply_chapter_overrides(
+            rendered, cfg.chapter_overrides_dir,
+        )
+        if override_report.applied:
+            log(f"  {override_report.summary_line()}")
+            for slug in override_report.applied[:10]:
+                log(f"    override: {slug}")
+        if override_report.stale:
+            log_event(
+                "chapter_overrides_stale",
+                slug=cfg.slug,
+                count=len(override_report.stale),
+                examples=override_report.stale[:10],
+            )
+            for stale in override_report.stale[:5]:
+                log(f"    stale override (no rendered chapter): {stale}")
 
         # 10. Cover
         cover_jpeg = cfg.caches_dir / "cover.jpg"

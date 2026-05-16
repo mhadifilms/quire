@@ -160,6 +160,21 @@ class BookConfig:
         """
         return self.book_dir / "qc_fixes.toml"
 
+    @property
+    def chapter_overrides_dir(self) -> Path:
+        """Optional per-book directory of full-chapter XHTML overrides.
+
+        For chapters where OCR + structure produce output too corrupt
+        to repair with small ``ocr_fixes.toml`` / ``qc_fixes.toml``
+        substitutions (multi-column reference tables, heavily
+        italicized glossaries, column-merged indexes), an author can
+        ship a hand-edited XHTML file at
+        ``<book_dir>/chapter_overrides/<chapter-slug>.xhtml`` and that
+        file will replace the rendered chapter wholesale, after the
+        typography stage. See ``quire.render.overrides``.
+        """
+        return self.book_dir / "chapter_overrides"
+
     def plugin_config(self, name: str) -> dict[str, Any]:
         return self.plugin_settings.get(name, {})
 
