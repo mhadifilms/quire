@@ -265,6 +265,48 @@ _COMMON_OCR_WORD_RE = re.compile(
 )
 
 
+_PROPER_NOUN_RE = re.compile(r"^[A-Z][a-z]{2,}$")
+_LOWERCASE_WORD_RE = re.compile(r"^[a-z]+(?:'[a-z]+)?$")
+_VOWEL_RE = re.compile(r"[aeiouy]")
+
+
+def _token_is_plausible_english(token: str) -> bool:
+    """Return True if ``token`` looks like real English text rather than
+    OCR mojibake.
+
+    Used by the cue-based mojibake replacement (Pass 2 in ``_clean_text``)
+    to bail out when the candidate span is plausible English. The rule
+    is intentionally permissive — we'd rather leave a fragment of
+    gibberish in the body for human QC than corrupt a legitimate word
+    like ``which``, ``Quran``, or ``Marwah``.
+
+    Plausible English is one of:
+
+    1. A short common word in ``_SAFE_SHORT`` (``the``, ``and``, ``of``…).
+    2. A capitalized proper-noun-shaped token (``[A-Z][a-z]{2,}``) such
+       as ``Kaaba``, ``Marwah``, ``Quran``, ``Allah``.
+    3. A lowercase token of 4+ letters (optional internal apostrophe)
+       containing at least one vowel — ``which``, ``while``, ``inward``,
+       ``aspect``, ``heaven``, ``don't``.
+
+    Pure-letter mojibake clusters like ``ji``, ``pal``, ``Eji`` fail
+    rules 2 and 3 (2 letters, no proper-noun shape) and let the cue
+    pass fire.
+    """
+    bare = re.sub(r"[!?,.;:]+$", "", token)
+    if not bare:
+        return True
+    if bare.lower() in _SAFE_SHORT:
+        return True
+    if _PROPER_NOUN_RE.match(bare):
+        return True
+    if _LOWERCASE_WORD_RE.match(bare):
+        letters = bare.replace("'", "")
+        if len(letters) >= 4 and _VOWEL_RE.search(bare):
+            return True
+    return False
+
+
 def _placeholder(citations: list[tuple[int, int]] | None) -> str:
     if citations:
         s, a = citations[0]
@@ -317,12 +359,23 @@ def _clean_text(text: str, citations: list[tuple[int, int]] | None) -> str:
                     break
             out = out[:start].rstrip() + " " + _placeholder(citations) + out[m.end():]
 
-    # Pass 2: cue-based mojibake
+    # Pass 2: cue-based mojibake.
+    #
+    # The cue pattern matches sentence shapes like ``, X is the …`` or
+    # ``the wording X means …``. Without any further guard this catches
+    # genuine OCR mojibake (``, jes is the …``), but it ALSO catches
+    # ordinary English prose (``, the Quran states that …``,
+    # ``, the Kaaba is the reflection of …``) and destroys it. We err
+    # on the side of caution: a replacement only fires when at least one
+    # token in the candidate span looks suspicious AND none of the tokens
+    # look like real English. See ``_token_is_plausible_english``.
     def _gib_repl(m: re.Match) -> str:
         gib = m.group("gib").strip()
-        toks = re.split(r"\s+", gib)
-        clean = [re.sub(r"[!?,.;:]+$", "", t).lower() for t in toks if t]
+        toks = [t for t in re.split(r"\s+", gib) if t]
+        clean = [re.sub(r"[!?,.;:]+$", "", t).lower() for t in toks]
         if not clean or any(len(t) > 6 for t in clean):
+            return m.group(0)
+        if all(_token_is_plausible_english(t) for t in toks):
             return m.group(0)
         unknown = [t for t in clean if t not in _SAFE_SHORT]
         if not unknown:

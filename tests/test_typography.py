@@ -103,6 +103,37 @@ class TestConvertLooseFootnoteDigits:
         # The ;3 inside href should be preserved verbatim
         assert 'href="x;3.html"' in new
 
+    def test_pulls_detached_digit_at_sentence_boundary(self) -> None:
+        # A small superscript footnote at a sentence boundary is often
+        # OCR'd as a detached digit on the next baseline: the rule
+        # should pull it back onto the prior word.
+        html = "<p>rites of Hajj. 1 This verse clearly</p>"
+        new, n = convert_loose_footnote_digits(html)
+        assert "rites of Hajj.\u00b9 This verse" in new
+        assert n == 1
+
+    def test_pulls_detached_digit_after_close_paren(self) -> None:
+        html = "<p>the latter] 2 The next sentence begins.</p>"
+        new, n = convert_loose_footnote_digits(html)
+        assert "the latter]\u00b2 The next sentence" in new
+        assert n == 1
+
+    def test_does_not_touch_detached_digit_before_lowercase(self) -> None:
+        # ``...obligation. 1 this`` -- lowercase ``this`` afterwards is
+        # ambiguous (e.g. a literal page number), so leave it alone.
+        html = "<p>obligation. 1 this verse clearly</p>"
+        new, n = convert_loose_footnote_digits(html)
+        assert new == html
+        assert n == 0
+
+    def test_does_not_touch_real_page_reference(self) -> None:
+        # ``vol 1 of`` / ``page 1 of`` -- digit between Capitalized
+        # tokens but not at a sentence boundary (no terminal punctuation).
+        html = "<p>see vol 1 of the series</p>"
+        new, n = convert_loose_footnote_digits(html)
+        assert new == html
+        assert n == 0
+
 
 # ---------- strip_footnote_misread_quotes ----------
 
@@ -184,15 +215,82 @@ class TestApplyQcFix:
         assert n == 0
         assert new == html
 
-    def test_skips_identical_replace(self) -> None:
-        # apply_qc_fix doesn't filter identical -- caller (load_qc_fixes
-        # / apply_typography_fixes) is expected to. But it should still
-        # not enter an infinite loop.
+    def test_identical_find_and_replace_in_pure_text_is_noop(self) -> None:
+        # When find == replace and the matched span is pure text (no
+        # consumed tags), the loop breaks early to avoid spinning.
         html = "<p>hello</p>"
         new, n = apply_qc_fix(html, "hello", "hello")
-        # Replaces but loop safety caps it.
-        assert n <= 50
-        assert new.endswith("</p>")
+        assert n == 0
+        assert new == html
+
+    def test_identical_find_and_replace_strips_consumed_sup(self) -> None:
+        # When the find string overlaps a leading ``<sup>`` and the
+        # plain-text replace equals the find, the HTML transformation
+        # still happens: the wrapper is consumed by boundary extension
+        # and emitted as plain text. Subsequent loop iterations are
+        # plain-text no-ops, so we run once and stop.
+        html = '<p class="body"><sup>1</sup>1:75 Abraham was forbearing</p>'
+        new, n = apply_qc_fix(
+            html,
+            "11:75 Abraham was forbearing",
+            "11:75 Abraham was forbearing",
+        )
+        assert n == 1
+        assert "<sup>" not in new
+        assert "11:75 Abraham was forbearing" in new
+
+    def test_nested_noteref_sup_is_extended_outward(self) -> None:
+        # Real-world OCR pattern: the engine wrapped the wrong leading
+        # digit in a complete <a noteref><sup>1</sup></a> pair. Plain
+        # text reads "1nd edition, Beirur:..." -- the find begins inside
+        # the sup, but the noteref encloses it. The implementation must
+        # extend left iteratively all the way to <a> so the whole
+        # spurious noteref is consumed.
+        html = (
+            '<p><a epub:type="noteref" href="#fn-1"><sup>1</sup></a>'
+            "nd edition, Beirur: A'lami Institute for Publications, 1983.</p>"
+        )
+        new, n = apply_qc_fix(
+            html,
+            "1nd edition, Beirur: A'lami Institute",
+            "2nd edition, Beirut: A'lami Institute",
+        )
+        assert n == 1
+        assert "<a" not in new
+        assert "<sup>" not in new
+        assert "2nd edition, Beirut: A'lami Institute" in new
+
+    def test_find_starting_inside_sup_extends_to_full_tag(self) -> None:
+        # Quran verse references in the index get an OCR'd first digit
+        # wrapped as ``<sup>1</sup>``. The plain text reads ``10:12 ...``
+        # and the agent's find begins with ``10``. The span starts INSIDE
+        # ``<sup>`` -- the implementation must extend left to capture the
+        # entire ``<sup>...</sup>`` pair so the replacement drops it.
+        html = '<p class="body"><sup>1</sup>0:12 Indeed I am your Lord!</p>'
+        new, n = apply_qc_fix(
+            html,
+            "10:12 Indeed I am your Lord!",
+            "20:12 Indeed I am your Lord!",
+        )
+        assert n == 1
+        # The <sup> wrapper is gone, replaced by the new "20" verse number.
+        assert "<sup>" not in new
+        assert "20:12 Indeed I am your Lord" in new
+
+    def test_find_ending_inside_sup_extends_past_close(self) -> None:
+        # Symmetric case: find ends mid-sup. The implementation must
+        # extend right past ``</sup>`` so the span covers the whole pair.
+        html = '<p>see also Quran 2:1<sup>1</sup>5 for context</p>'
+        new, n = apply_qc_fix(
+            html,
+            "see also Quran 2:11",
+            "see also Quran 2:21",
+        )
+        # The "1" inside <sup> is the last char of the find. The span
+        # extends to include </sup>, and the wrapper is dropped.
+        assert n == 1
+        assert "<sup>" not in new
+        assert "see also Quran 2:21" in new
 
 
 # ---------- load_qc_fixes ----------
@@ -210,13 +308,30 @@ class TestLoadQcFixes:
     def test_missing_file_returns_empty(self, tmp_path: pathlib.Path) -> None:
         assert load_qc_fixes(tmp_path / "nonexistent.toml") == {}
 
-    def test_drops_identical_and_empty(self, tmp_path: pathlib.Path) -> None:
+    def test_drops_empty_keys(self, tmp_path: pathlib.Path) -> None:
         p = tmp_path / "qc_fixes.toml"
         p.write_text(
-            '[phrase]\n"same" = "same"\n"" = "x"\n"keep" = "keeper"\n',
+            '[phrase]\n"" = "x"\n"keep" = "keeper"\n',
             encoding="utf-8",
         )
         assert load_qc_fixes(p) == {"keep": "keeper"}
+
+    def test_keeps_identical_find_and_replace(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        # When the find string starts inside a footnote-ref tag, the
+        # plain-text find and replace can be identical -- the HTML-level
+        # transformation strips the wrapper tag. These entries must be
+        # preserved by the loader.
+        p = tmp_path / "qc_fixes.toml"
+        p.write_text(
+            '[phrase]\n'
+            '"11:75 Abraham was indeed" = "11:75 Abraham was indeed"\n',
+            encoding="utf-8",
+        )
+        out = load_qc_fixes(p)
+        assert "11:75 Abraham was indeed" in out
+        assert out["11:75 Abraham was indeed"] == "11:75 Abraham was indeed"
 
 
 # ---------- end-to-end driver ----------
@@ -262,6 +377,73 @@ class TestApplyTypographyFixes:
         vocab = {"manuscript", "and"}
         _, rep = apply_typography_fixes(rendered, vocab=vocab)
         assert "hyphen" in rep.summary_line()
+
+    def test_qc_fixes_apply_fixed_point_independent_of_order(self) -> None:
+        # Regression: two qc_fixes entries where the long contextual one
+        # only matches AFTER the short OCR correction runs. Both orderings
+        # must produce the same final text under the fixed-point loop.
+        rendered_a = [("ch", "<p>paying attention to chem, [Arabic] is the owner.</p>")]
+        rendered_b = [("ch", "<p>paying attention to chem, [Arabic] is the owner.</p>")]
+        vocab = build_vocab("attention owner")
+
+        # Order 1: long contextual entry declared FIRST (used to silently
+        # no-op because the find string didn't match the pre-fix text).
+        new_a, rep_a = apply_typography_fixes(
+            rendered_a,
+            vocab=vocab,
+            qc_fixes={
+                "attention to them, [Arabic] is the owner": "attention to them, since Allah is the owner",
+                "attention to chem,": "attention to them,",
+            },
+        )
+        # Order 2: short OCR correction declared FIRST.
+        new_b, rep_b = apply_typography_fixes(
+            rendered_b,
+            vocab=vocab,
+            qc_fixes={
+                "attention to chem,": "attention to them,",
+                "attention to them, [Arabic] is the owner": "attention to them, since Allah is the owner",
+            },
+        )
+        for new, rep in ((new_a, rep_a), (new_b, rep_b)):
+            assert "chem" not in new[0][1]
+            assert "[Arabic]" not in new[0][1]
+            assert "since Allah is the owner" in new[0][1]
+            assert rep.qc_fix_unique == 2
+            assert rep.qc_tag_skipped_entries == []
+            assert rep.qc_no_op_entries == []
+
+    def test_qc_fixes_surfaces_tag_skipped_entries(self) -> None:
+        # A find string that crosses an <em> boundary cannot apply; the
+        # report must surface it so the author can fix the entry rather
+        # than have it silently rot in qc_fixes.toml.
+        rendered = [("ch", '<p>name <em>X</em>, [Arabic] is the rule.</p>')]
+        vocab = build_vocab("rule name")
+        new, rep = apply_typography_fixes(
+            rendered,
+            vocab=vocab,
+            qc_fixes={"X, [Arabic] is the rule.": "X, something is the rule."},
+        )
+        # Original markup intact, no replacement happened.
+        assert new[0][1] == rendered[0][1]
+        # ...but the entry is surfaced for the author.
+        assert rep.qc_fix_count == 0
+        assert rep.qc_tag_skipped_entries == ["X, [Arabic] is the rule."]
+        assert rep.qc_no_op_entries == []
+        assert "skipped" in rep.summary_line()
+
+    def test_qc_fixes_surfaces_no_op_entries(self) -> None:
+        # A find string nowhere in any chapter ends up in qc_no_op_entries
+        # rather than qc_tag_skipped_entries.
+        rendered = [("ch", "<p>Normal prose with nothing to fix.</p>")]
+        vocab = build_vocab("normal prose")
+        _, rep = apply_typography_fixes(
+            rendered,
+            vocab=vocab,
+            qc_fixes={"missing find string": "never applied"},
+        )
+        assert rep.qc_no_op_entries == ["missing find string"]
+        assert rep.qc_tag_skipped_entries == []
 
 
 # ---------- regression: must not break valid HTML ----------

@@ -52,6 +52,102 @@ def test_mojibake_preserves_normal_text() -> None:
     assert pages[0]["elements"][0]["text"] == "Perfectly fine English."
 
 
+# ---------- Pass-2 cue regex conservatism (regression guards) ----------
+#
+# The cue regex matches sentence shapes like ``, X is the …``. Before the
+# token-plausibility guard was added it nuked legitimate English prose,
+# replacing words like ``the Quran`` / ``the Kaaba`` / ``which`` / ``but
+# its inward aspect`` with the literal token ``[Arabic]``. These cases
+# must round-trip unchanged.
+
+def test_mojibake_pass2_preserves_proper_noun_after_comma() -> None:
+    pages = [{"elements": [
+        {
+            "kind": "paragraph",
+            "text": (
+                "It declares that the Lord does not call His servants to "
+                "carry out a task unless they are able to perform it. "
+                "Elsewhere, the Quran states that:"
+            ),
+            "y": 1,
+        }
+    ]}]
+    mojibake.post_structure(_Cfg(), pages)
+    out = pages[0]["elements"][0]["text"]
+    assert "Elsewhere, the Quran states that:" in out
+    assert "[Arabic]" not in out
+
+
+def test_mojibake_pass2_preserves_short_common_english_word() -> None:
+    pages = [{"elements": [
+        {
+            "kind": "paragraph",
+            "text": (
+                "The inner meaning of the Yamani Corner is walayah, which "
+                "is the divinely appointed authority of imamate."
+            ),
+            "y": 1,
+        }
+    ]}]
+    mojibake.post_structure(_Cfg(), pages)
+    out = pages[0]["elements"][0]["text"]
+    assert "walayah, which is the divinely" in out
+    assert "[Arabic]" not in out
+
+
+def test_mojibake_pass2_preserves_multi_word_english_phrase() -> None:
+    pages = [{"elements": [
+        {
+            "kind": "paragraph",
+            "text": (
+                "is the well-known House in Makkah, but its inward aspect "
+                "is the heart of the perfect human being"
+            ),
+            "y": 1,
+        }
+    ]}]
+    mojibake.post_structure(_Cfg(), pages)
+    out = pages[0]["elements"][0]["text"]
+    assert "but its inward aspect is the heart" in out
+    assert "[Arabic]" not in out
+
+
+def test_mojibake_pass2_preserves_known_proper_nouns() -> None:
+    # Each phrase here was destroyed by the old cue regex. They must
+    # survive verbatim under the conservative plausibility rule.
+    samples = [
+        "According to a tradition of Ali ibn Abi-Talib, the Kaaba is the reflection of al-Bayt al-Ma'mur upon the earth.",
+        "Safa is the full scale, and Marwah is the empty one.",
+        "Resurrection, and know that Safa is the scale of his good deeds and Marwah is the scale of his evil deeds.",
+    ]
+    pages = [
+        {"elements": [{"kind": "paragraph", "text": s, "y": 1}]}
+        for s in samples
+    ]
+    mojibake.post_structure(_Cfg(), pages)
+    for original, page in zip(samples, pages, strict=False):
+        out = page["elements"][0]["text"]
+        assert "[Arabic]" not in out, f"corrupted: {out!r}"
+        assert original == out, f"changed: {original!r} -> {out!r}"
+
+
+def test_mojibake_pass2_still_catches_pure_letter_gibberish() -> None:
+    # The cue pass is conservative but must still fire when there is a
+    # clear mojibake signal: pure-lowercase 1-3 letter tokens that are
+    # neither a known short word nor a real English word.
+    pages = [{"elements": [
+        {
+            "kind": "paragraph",
+            "text": "The verse jes ne ji here means something.",
+            "y": 1,
+        }
+    ]}]
+    mojibake.post_structure(_Cfg(), pages)
+    out = pages[0]["elements"][0]["text"]
+    assert "[Arabic]" in out
+    assert "jes ne ji" not in out
+
+
 def test_mojibake_cleanup_applies_common_fixes_to_footnotes() -> None:
     """The shared common_fixes.toml dictionary should apply to footnote
     elements just like body paragraphs. Uses only generic t->r scanner

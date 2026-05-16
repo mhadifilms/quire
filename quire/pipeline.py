@@ -1360,6 +1360,24 @@ def _build_book_with_doc(
         if typo_report.hyphen_examples:
             for ex in typo_report.hyphen_examples[:5]:
                 log(f"    hyphen: {ex}")
+        if typo_report.qc_tag_skipped_entries:
+            log(
+                "  qc_fixes.toml: "
+                f"{len(typo_report.qc_tag_skipped_entries)} entry/entries "
+                "skipped because their find span crosses an inline tag "
+                "(<em>, <span>, etc.). Rewrite the find string to start/end "
+                "outside the markup so the substitution can apply."
+            )
+            for entry in typo_report.qc_tag_skipped_entries[:5]:
+                preview = entry if len(entry) <= 80 else entry[:77] + "..."
+                log(f"    tag-skipped: {preview!r}")
+        if typo_report.qc_no_op_entries:
+            log_event(
+                "qc_fixes_no_op",
+                slug=cfg.slug,
+                count=len(typo_report.qc_no_op_entries),
+                examples=typo_report.qc_no_op_entries[:10],
+            )
 
         # 10. Cover
         cover_jpeg = cfg.caches_dir / "cover.jpg"

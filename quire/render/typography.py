@@ -195,14 +195,30 @@ def convert_loose_footnote_digits(html: str) -> tuple[str, int]:
     """Convert digit footnote markers attached to surrounding text into
     Unicode superscript characters.
 
-    Patterns matched:
-      - ``;\\d`` / ``,\\d`` followed by space + lowercase letter
-        (mid-sentence continuation after a clause-final marker).
-      - ``word\\d`` followed by space + lowercase letter
-        (footnote on a noun like ``Smith1 has``).
+    Patterns matched (in order, conservative each time):
 
-    Conservative: requires the digit be followed by ``space + lowercase``
-    so we don't catch real numerics like ``2026 was`` or ``vol 1 page``.
+      1. ``;\\d`` / ``,\\d`` followed by space + lowercase letter
+         — ``rare;3 rather`` -> ``rare;\u00b3 rather``.
+         Mid-sentence continuation after a clause-final marker.
+
+      2. ``word\\d`` followed by space + lowercase letter
+         — ``Smith1 has`` -> ``Smith\u00b9 has``.
+         Footnote glued to a noun before the next clause.
+
+      3. ``word.\\s+\\d\\s+`` followed by a Capital-then-lowercase
+         word — ``obligation. 1 This verse`` ->
+         ``obligation.\u00b9 This verse``. The OCR engine consistently
+         turns a small superscript footnote marker at a sentence
+         boundary into a free-standing digit on the next baseline,
+         producing ``... sentence end. 1 Next sentence``. This rule
+         pulls that digit back onto the previous word as a superscript.
+
+      Conservative across all three:
+      - Digit must be 1-2 chars (footnote numbers don't exceed 99).
+      - The character AFTER the digit determines safety: a lowercase
+        letter (rules 1+2) or a capitalized word starting a sentence
+        (rule 3). Real numerics like ``2026 was`` or ``vol 1 of``
+        don't match because they lack the lower/Cap-lowercase shape.
     """
 
     def fix(text: str) -> tuple[str, int]:
@@ -213,8 +229,23 @@ def convert_loose_footnote_digits(html: str) -> tuple[str, int]:
             n_local += 1
             return m.group(1) + m.group(2).translate(_SUP_DIGITS)
 
+        # 1. ;1 or ,1 mid-sentence
         new = re.sub(r'([;,])(\d{1,2})(?=\s+[a-z])', repl, text)
+        # 2. word1 has -> word¹ has
         new = re.sub(r'([a-z])(\d{1,2})(?=\s+[a-z])', repl, new)
+        # 3. obligation. 1 This -> obligation.¹ This
+        #    Detached digit at sentence boundary, lookbehind word ends
+        #    in a clause/sentence punctuation and a single space.
+        def boundary_repl(m: re.Match) -> str:
+            nonlocal n_local
+            n_local += 1
+            return m.group(1) + m.group(2).translate(_SUP_DIGITS) + " "
+
+        new = re.sub(
+            r'([a-z][.!?\)\]])\s+(\d{1,2})\s+(?=[A-Z][a-z])',
+            boundary_repl,
+            new,
+        )
         return new, n_local
 
     return _operate_on_text_only(html, fix)
@@ -280,6 +311,81 @@ _FN_NOTEREF_A_RE = re.compile(
 )
 _FN_SUP_RE = re.compile(r'<sup\b[^>]*>.*?</sup>', re.S)
 
+# Tag-pair openings we treat as preserved footnote refs. Order matters:
+# longer/more specific first so we don't shadow.
+_FN_OPENINGS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r'<a\b[^>]*epub:type="noteref"[^>]*>'), "</a>"),
+    (re.compile(r"<sup\b[^>]*>"), "</sup>"),
+)
+
+
+def _extend_left_into_footnote_tag(html: str, start: int) -> int:
+    """If ``start`` lies inside a ``<sup>`` or ``<a noteref>`` opening
+    tag's content, return the position of the tag's ``<`` so the matched
+    span includes the whole tag pair. Iterates outward so a nested
+    ``<a noteref><sup>1</sup></a>`` structure is captured in one call.
+
+    Returns ``start`` unchanged when the position is not inside a
+    footnote-ref tag.
+    """
+    cursor = start
+    while True:
+        new = _extend_left_one_level(html, cursor)
+        if new >= cursor:
+            return cursor
+        cursor = new
+
+
+def _extend_left_one_level(html: str, start: int) -> int:
+    window_start = max(0, start - 200)
+    chunk = html[window_start:start]
+    last_open = chunk.rfind("<")
+    if last_open < 0:
+        return start
+    tag_open_pos = window_start + last_open
+    close_gt = html.find(">", tag_open_pos, start)
+    if close_gt < 0:
+        return start
+    opening = html[tag_open_pos:close_gt + 1]
+    for pattern, _ in _FN_OPENINGS:
+        if pattern.fullmatch(opening):
+            return tag_open_pos
+    return start
+
+
+def _extend_right_out_of_footnote_tag(html: str, end: int) -> int:
+    """If ``end`` lies inside the content of a ``<sup>`` or ``<a noteref>``
+    tag (i.e. before its closing tag), return the position just after the
+    closing tag so the full pair is included in the matched span. Iterates
+    outward so a nested footnote structure is captured.
+
+    Returns ``end`` unchanged when not inside such a tag.
+    """
+    cursor = end
+    while True:
+        new = _extend_right_one_level(html, cursor)
+        if new <= cursor:
+            return cursor
+        cursor = new
+
+
+def _extend_right_one_level(html: str, end: int) -> int:
+    for pattern, close_str in _FN_OPENINGS:
+        last_open_match: re.Match[str] | None = None
+        for m in pattern.finditer(html, 0, end):
+            last_open_match = m
+        if not last_open_match:
+            continue
+        open_end = last_open_match.end()
+        if open_end >= end:
+            continue
+        close_idx = html.find(close_str, open_end, end)
+        if close_idx < 0:
+            close_after = html.find(close_str, end)
+            if close_after >= 0:
+                return close_after + len(close_str)
+    return end
+
 
 def apply_qc_fix(html: str, find: str, replace: str) -> tuple[str, int]:
     """Replace plain-text occurrences of ``find`` with ``replace`` in
@@ -317,24 +423,62 @@ def apply_qc_fix(html: str, find: str, replace: str) -> tuple[str, int]:
             m = re.match(r"&[#a-zA-Z0-9]+;", new_html[end_html_char:])
             if m:
                 end_html = end_html_char + len(m.group())
+
+        # Extend boundaries outward if start/end falls INSIDE a footnote
+        # ref tag (``<sup>...</sup>`` or ``<a epub:type="noteref">...</a>``).
+        # Otherwise the span would split the tag, leaving an unbalanced
+        # ``</sup>`` or ``</a>`` in the residue and tripping the tag-
+        # safety guard. By widening to the whole tag pair we let the
+        # preservation logic catch the noteref cleanly. This is critical
+        # for find strings that begin with the digit collapsed out of a
+        # leading ``<sup>1</sup>`` (e.g. Quran verse references in the
+        # index where the first digit was OCR'd as a superscript). When
+        # we extend INTO a tag, the digit it contained is part of the
+        # text the user wants to overwrite -- so that tag is NOT
+        # preserved (treated as consumed by the replacement).
+        new_start = _extend_left_into_footnote_tag(new_html, start_html)
+        extended_left = new_start < start_html
+        start_html = new_start
+        new_end = _extend_right_out_of_footnote_tag(new_html, end_html)
+        extended_right = new_end > end_html
+        end_html = new_end
         span = new_html[start_html:end_html]
 
         # Pure-text match — trivial replace.
         if "<" not in span and ">" not in span:
-            new_html = new_html[:start_html] + replace + new_html[end_html:]
+            candidate = new_html[:start_html] + replace + new_html[end_html:]
+            if candidate == new_html:
+                # No-op iteration (find == replace, no tags consumed):
+                # break to avoid spinning until the safety cap.
+                break
+            new_html = candidate
             count += 1
             continue
 
         # Tag-bearing match — only acceptable if every tag in the span
         # is a preserved footnote ref (noteref <a> or bare <sup>).
-        noterefs = _FN_NOTEREF_A_RE.findall(span)
+        noterefs = list(_FN_NOTEREF_A_RE.findall(span))
         residue = _FN_NOTEREF_A_RE.sub("", span)
-        sup_blocks = _FN_SUP_RE.findall(residue)
+        sup_blocks = list(_FN_SUP_RE.findall(residue))
         residue = _FN_SUP_RE.sub("", residue)
         if "<" in residue or ">" in residue:
             # Other tags (em / strong / span / a-not-noteref) present.
             # Skip to avoid corrupting markup.
             break
+        # Drop any preserved tag that was consumed by boundary extension.
+        # The extension added the tag to the span specifically because
+        # the user's find string overlapped its content -- preserving it
+        # would re-insert the very bug we're trying to fix.
+        if extended_left:
+            if _FN_NOTEREF_A_RE.match(span):
+                noterefs = noterefs[1:]
+            elif _FN_SUP_RE.match(span):
+                sup_blocks = sup_blocks[1:]
+        if extended_right:
+            if span.endswith("</a>") and noterefs:
+                noterefs = noterefs[:-1]
+            elif span.endswith("</sup>") and sup_blocks:
+                sup_blocks = sup_blocks[:-1]
         preserved = "".join(noterefs) + "".join(sup_blocks)
         new_html = new_html[:start_html] + replace + preserved + new_html[end_html:]
         count += 1
@@ -348,8 +492,12 @@ def load_qc_fixes(path: Path) -> dict[str, str]:
         "find text" = "replace text"
         "another find" = "another replace"
 
-    Identical and empty entries are dropped. Returns an empty dict if the
-    file does not exist or is malformed.
+    Empty keys are dropped. Identical ``find == replace`` entries are
+    KEPT because they're meaningful when the find string starts inside
+    a ``<sup>`` / ``<a noteref>`` opening tag and the user wants the tag
+    pair stripped without changing the plain text (see
+    ``_extend_left_into_footnote_tag`` in ``apply_qc_fix``). Returns an
+    empty dict if the file does not exist or is malformed.
     """
     if not path.exists():
         return {}
@@ -365,7 +513,7 @@ def load_qc_fixes(path: Path) -> dict[str, str]:
     for k, v in phrases.items():
         if not isinstance(k, str) or not isinstance(v, str):
             continue
-        if not k or k == v:
+        if not k:
             continue
         out[k] = v
     return out
@@ -373,12 +521,17 @@ def load_qc_fixes(path: Path) -> dict[str, str]:
 
 # ---------- driver ----------
 
+_QC_FIXPOINT_MAX_PASSES = 4
+
+
 @dataclass
 class TypographyReport:
     """Aggregated counts and details of typography fixes applied."""
 
     qc_fix_count: int = 0
     qc_fix_unique: int = 0
+    qc_no_op_entries: list[str] = field(default_factory=list)
+    qc_tag_skipped_entries: list[str] = field(default_factory=list)
     hyphen_stitches: int = 0
     hyphen_examples: list[str] = field(default_factory=list)
     footnote_digits: int = 0
@@ -388,6 +541,10 @@ class TypographyReport:
         parts = []
         if self.qc_fix_count:
             parts.append(f"{self.qc_fix_count} qc fix(es)")
+        if self.qc_tag_skipped_entries:
+            parts.append(
+                f"{len(self.qc_tag_skipped_entries)} qc fix(es) skipped (inline-tag span)"
+            )
         if self.hyphen_stitches:
             parts.append(f"{self.hyphen_stitches} hyphen stitch(es)")
         if self.footnote_digits:
@@ -418,6 +575,24 @@ def apply_typography_fixes(
         Optional ``{find: replace}`` mapping (typically loaded from
         ``qc_fixes.toml``) applied to each chapter's XHTML.
 
+    qc_fixes are applied in a fixed-point loop (up to
+    ``_QC_FIXPOINT_MAX_PASSES`` passes per chapter) so that an entry
+    whose ``find`` only matches after some other entry has rewritten the
+    text — e.g. a long contextual fix that depends on a prior
+    short-word OCR correction — still applies regardless of the
+    declaration order in ``qc_fixes.toml``.
+
+    The returned report distinguishes three terminal states per
+    ``qc_fixes`` entry:
+
+    * applied at least once (counted in ``qc_fix_count`` / ``qc_fix_unique``);
+    * never matched anywhere — likely stale / mistyped (``qc_no_op_entries``);
+    * the ``find`` text exists in the final output but every match was
+      skipped by the ``apply_qc_fix`` inline-tag safety guard
+      (``qc_tag_skipped_entries``). This is almost always a bug in the
+      ``find`` string: rewrite it to start/end outside of ``<em>``,
+      ``<span>``, or other non-noteref markup.
+
     Returns ``(new_rendered, report)``.
     """
     qc_fixes = qc_fixes or {}
@@ -428,11 +603,16 @@ def apply_typography_fixes(
     for slug, html in rendered:
         new_html = html
 
-        for find, replace in qc_fixes.items():
-            new_html, n = apply_qc_fix(new_html, find, replace)
-            if n:
-                rep.qc_fix_count += n
-                qc_unique_matched.add(find)
+        for _ in range(_QC_FIXPOINT_MAX_PASSES):
+            applied_this_pass = False
+            for find, replace in qc_fixes.items():
+                new_html, n = apply_qc_fix(new_html, find, replace)
+                if n:
+                    rep.qc_fix_count += n
+                    qc_unique_matched.add(find)
+                    applied_this_pass = True
+            if not applied_this_pass:
+                break
 
         new_html, hfixes = stitch_hyphens(new_html, vocab)
         rep.hyphen_stitches += len(hfixes)
@@ -447,4 +627,23 @@ def apply_typography_fixes(
         out.append((slug, new_html))
 
     rep.qc_fix_unique = len(qc_unique_matched)
+
+    # Surface qc_fixes entries that never applied. We split them into two
+    # buckets by probing the final plain text across all chapters: a find
+    # string still present in the rendered output that never matched
+    # means the inline-tag safety guard skipped every candidate; a find
+    # string completely absent is simply stale or mistyped.
+    if qc_fixes:
+        unmatched = [f for f in qc_fixes if f not in qc_unique_matched]
+        if unmatched:
+            final_plain_parts: list[str] = []
+            for _slug, h in out:
+                p, _ = html_to_plain(h)
+                final_plain_parts.append(p)
+            final_plain = "\n".join(final_plain_parts)
+            tag_skipped = sorted(f for f in unmatched if f and f in final_plain)
+            no_op = sorted(f for f in unmatched if f and f not in final_plain)
+            rep.qc_tag_skipped_entries = tag_skipped
+            rep.qc_no_op_entries = no_op
+
     return out, rep
