@@ -274,12 +274,19 @@ def run_audit(
 
     # Apply the same hallucination filters the pipeline does, so the audit
     # report does NOT silently inflate Tesseract's Arabic count with
-    # bibliography hallucination — the per-block ``strict_digits`` filter,
-    # the block-level embedded-text/diacritic guard, and the page-level
+    # bibliography hallucination — the line-level pre-cluster filter, the
+    # per-block ``strict_digits`` filter, the block-level
+    # embedded-text/diacritic guard, and the page-level
     # ``_page_is_english_citation_dense`` guard.
+    import statistics as _stats
+
+    from ..extract.ocr import cluster_arabic_blocks
     from ..pipeline import (
+        _arabic_dominant,
         _embedded_english_words,
         _is_embedded_text_hallucination,
+        _is_line_geometric_artifact,
+        _is_line_hallucination,
         _page_is_english_citation_dense,
     )
     strict_digits = audit_engine == "tesseract"
@@ -293,9 +300,45 @@ def run_audit(
             embed_doc = None
     ocr_chars_real = 0
     for p in ocr_pages:
-        kept = _filter_vision_blocks(
-            list(p.get("arabic_blocks", [])), strict_digits=strict_digits,
-        )
+        # For Tesseract: re-derive blocks from ar_lines using the same
+        # line-level filter + cluster + block filter chain the pipeline
+        # uses. For Vision: read the cached arabic_blocks directly.
+        if embed_suppress and p.get("ar_lines"):
+            pno = p.get("pno")
+            page_idx = (pno - 1) if isinstance(pno, int) and pno >= 1 else None
+            embedded_for_lines: list = []
+            if (
+                embed_doc is not None
+                and page_idx is not None
+                and 0 <= page_idx < len(embed_doc)
+            ):
+                embedded_for_lines = _embedded_english_words(embed_doc, page_idx)
+            ar_lines = [
+                L for L in p.get("ar_lines", []) if _arabic_dominant(L.get("text", ""))
+            ]
+            ar_lines = [
+                L for L in ar_lines if not _is_line_geometric_artifact(L)
+            ]
+            if embedded_for_lines:
+                ar_lines = [
+                    L for L in ar_lines
+                    if not _is_line_hallucination(L, embedded_for_lines)
+                ]
+            if ar_lines:
+                heights = [
+                    L["y1"] - L["y0"] for L in ar_lines if L["y1"] > L["y0"]
+                ]
+                avg_h = _stats.median(heights) if heights else 14.0
+                blocks = cluster_arabic_blocks(ar_lines, avg_h)
+                for b in blocks:
+                    if 0 < b.get("conf", -1) <= 1.0:
+                        b["conf"] *= 100
+            else:
+                blocks = []
+        else:
+            blocks = list(p.get("arabic_blocks", []))
+
+        kept = _filter_vision_blocks(blocks, strict_digits=strict_digits)
         # Mirror the pipeline's block-level embedded-text filter.
         if embed_suppress and embed_doc is not None and kept:
             pno = p.get("pno")

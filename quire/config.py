@@ -122,6 +122,18 @@ class BookConfig:
     def lock_path(self) -> Path:
         return self.artifact_dir / ".build.lock"
 
+    @property
+    def qc_fixes_path(self) -> Path:
+        """Optional per-book HTML-layer corrections file.
+
+        Same TOML schema as ``ocr_fixes.toml`` (a ``[phrase]`` table) but
+        applied at the post-render stage where rendered text contains
+        collapsed footnote markers. Use this for corrections proposed by
+        a human / agent QC pass that match the rendered output instead
+        of the raw OCR cache.
+        """
+        return self.book_dir / "qc_fixes.toml"
+
     def plugin_config(self, name: str) -> dict[str, Any]:
         return self.plugin_settings.get(name, {})
 

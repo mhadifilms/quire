@@ -140,10 +140,10 @@ def test_page_is_english_citation_dense_flags_bibliography_page() -> None:
     """Citation-dense English page with no anchoring Arabic = hallucination."""
     bibliography_page = {
         "en_lines": [
-            {"text": "Amuli, Sayyid Haydar. Nass al-Nusus, vol. 1, p. 234.", "conf": 90},
-            {"text": "Beirut: Dar al-Kotob al-Ilmiyah, 1999.", "conf": 92},
-            {"text": "Ibn Arabi. Al-Futuhat al-Makkiyah, 9 vols., Beirut 2002.", "conf": 88},
-            {"text": "Qom: Alulbayt Institute, 1988. pp. 161-4.", "conf": 92},
+            {"text": "Author, A. B. The Title of an Important Work, vol. 1, p. 234.", "conf": 90},
+            {"text": "Eastside: Some Acme Publishing House, 1999. pp. 12-45.", "conf": 92},
+            {"text": "Smith, J. K. Another Long Reference Title, 9 vols., Westville 2002.", "conf": 88},
+            {"text": "Westville: General Institute Press, 1988. pp. 161-4, vol. 7.", "conf": 92},
         ] * 6,
         "arabic_blocks": [
             {"text": "عط لعكتوعء لصة لعجوعاتهة طع4 ,معمسساه؟",
@@ -180,8 +180,8 @@ def test_page_is_english_citation_dense_skips_low_digit_pages() -> None:
     """Prose pages without citation-density of digits should NOT be flagged."""
     prose_page = {
         "en_lines": [
-            {"text": "The pilgrim then enters the state of ihram before crossing the miqat.", "conf": 90},
-            {"text": "He performs ablution and dons the two unsewn white garments.", "conf": 92},
+            {"text": "The protagonist walked slowly down the quiet alley toward home.", "conf": 90},
+            {"text": "She paused at the doorway, listening to the rain on the roof.", "conf": 92},
         ] * 15,
         "arabic_blocks": [
             {"text": "إنا لله وإنا إليه راجعون", "conf": 40,
@@ -201,6 +201,137 @@ def test_page_is_english_citation_dense_skips_short_pages() -> None:
         "arabic_blocks": [{"text": "هذا الكتاب", "conf": 50}],
     }
     assert not pipeline._page_is_english_citation_dense(short_page)
+
+
+def test_is_line_geometric_artifact_drops_tall_thin_binding() -> None:
+    """A 10pt-wide, 220pt-tall "line" is the scan binding/spine, not text."""
+    spine = {
+        "x0": 14.0, "y0": 30.0, "x1": 24.0, "y1": 260.0,
+        "text": "ع ع ست ا ا ا _ ون وى وما اكد __",
+        "conf": 30.0,
+    }
+    assert pipeline._is_line_geometric_artifact(spine)
+
+
+def test_is_line_geometric_artifact_drops_narrow_column() -> None:
+    """A square-ish narrow "line" (height ≈ width and width < 60pt) is also
+    an artifact (margin glyph, page-edge spot, etc.)."""
+    blob = {
+        "x0": 12.0, "y0": 100.0, "x1": 38.0, "y1": 150.0,
+        "text": "د د د",
+        "conf": 25.0,
+    }
+    assert pipeline._is_line_geometric_artifact(blob)
+
+
+def test_is_line_geometric_artifact_keeps_real_text_line() -> None:
+    """A standard 300pt-wide, 15pt-tall text line is never an artifact."""
+    real = {
+        "x0": 50.0, "y0": 100.0, "x1": 350.0, "y1": 115.0,
+        "text": "بسم الله الرحمن الرحيم",
+        "conf": 85.0,
+    }
+    assert not pipeline._is_line_geometric_artifact(real)
+
+
+def test_is_line_geometric_artifact_keeps_short_real_word() -> None:
+    """A 50pt-wide, 14pt-tall single-word fragment is real text, not artifact."""
+    short_real = {
+        "x0": 100.0, "y0": 200.0, "x1": 150.0, "y1": 214.0,
+        "text": "الحج",
+        "conf": 80.0,
+    }
+    assert not pipeline._is_line_geometric_artifact(short_real)
+
+
+def test_is_line_hallucination_drops_very_low_conf_over_english() -> None:
+    """A < 35-conf line that overlays embedded English is hallucination."""
+    line = {
+        "x0": 60.0, "y0": 360.0, "x1": 360.0, "y1": 372.0,
+        "text": "-ععع1! طعنطب [كمزع] لعمسعط صموع دز [(دملم]",
+        "conf": 28.6,
+    }
+    embedded = [(60.0, 362.0, 360.0, 372.0)]
+    assert pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_drops_no_diacritic_low_conf_over_english() -> None:
+    """A no-diacritic line at conf 38 over embedded English (between 35 and
+    50) is also hallucination. Catches the case where the very-low-conf
+    rule alone doesn't fire."""
+    line = {
+        "x0": 50.0, "y0": 500.0, "x1": 280.0, "y1": 515.0,
+        "text": ".0 مم ,1 .له ,أمسهكم اه أممكضائط أعطول-/ق",
+        "conf": 38.4,
+    }
+    embedded = [(50.0, 502.0, 280.0, 515.0)]
+    assert pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_drops_fake_diacritic_with_clutter() -> None:
+    """Tesseract's "fake diacritic" mode: it sprinkles 1-2 tashkeel into a
+    reversed-Latin chain to dodge a binary diacritic gate. With only
+    sparse diacritics and heavy ASCII clutter at mid-conf, the line is
+    still hallucination."""
+    line = {
+        "x0": 60.0, "y0": 200.0, "x1": 360.0, "y1": 212.0,
+        # 1 fake diacritic in ~50 ar-chars (sparse: density < 3%)
+        # mixed with heavy ASCII clutter (brackets, digits, periods, comma)
+        "text": "ععع1 طعنطب [كمزع] ألَنت لعمسعط صموع دز [(دملم] ألنث ,3 ,5 .طدالة م ععصعتلءطه أه",
+        "conf": 55.0,
+    }
+    embedded = [(60.0, 202.0, 360.0, 212.0)]
+    assert pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_keeps_real_arabic_at_mid_conf() -> None:
+    """Real Arabic with proper diacritic density survives even at mid-conf."""
+    line = {
+        "x0": 50.0, "y0": 100.0, "x1": 350.0, "y1": 115.0,
+        "text": "بِسْمِ ٱللَّهِ ٱلرَّحْمَـٰنِ ٱلرَّحِيمِ",
+        "conf": 45.0,
+    }
+    embedded = [(50.0, 102.0, 350.0, 115.0)]
+    assert not pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_keeps_heavily_diacritised_low_conf() -> None:
+    """A low-confidence (< 35) line is normally rejected, but heavily
+    diacritised classical Arabic is real text — even at low OCR confidence
+    on a faded scan — and must be preserved."""
+    line = {
+        "x0": 50.0, "y0": 100.0, "x1": 350.0, "y1": 115.0,
+        # Classical Arabic with full tashkeel; density well above 5 %.
+        "text": "وَالنَّجْمُ الْهَادِي فِي غَيَاهِبِ الدُّجَى وَالسَّيِّدِ النَّفَّاعِ",
+        "conf": 25.0,
+    }
+    embedded = [(50.0, 102.0, 350.0, 115.0)]
+    assert not pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_keeps_lines_off_embedded_english() -> None:
+    """A no-diacritic line that doesn't overlay embedded English is left alone.
+    (May be real modern Arabic the embedded layer missed.)"""
+    line = {
+        "x0": 50.0, "y0": 100.0, "x1": 350.0, "y1": 115.0,
+        "text": "هذا نص عربي بدون تشكيل",
+        "conf": 30.0,
+    }
+    # English embedded text is on a completely different y-band
+    embedded = [(50.0, 500.0, 350.0, 525.0)]
+    assert not pipeline._is_line_hallucination(line, embedded)
+
+
+def test_is_line_hallucination_keeps_high_conf_lines() -> None:
+    """A line at conf ≥ 60 is never dropped by the line filter, regardless
+    of diacritic density. The block-level filter handles high-conf cases."""
+    line = {
+        "x0": 50.0, "y0": 100.0, "x1": 350.0, "y1": 115.0,
+        "text": "نص عربي بدون تشكيل عند ثقة عالية",
+        "conf": 75.0,
+    }
+    embedded = [(50.0, 102.0, 350.0, 115.0)]
+    assert not pipeline._is_line_hallucination(line, embedded)
 
 
 def test_arabic_dominant_true() -> None:

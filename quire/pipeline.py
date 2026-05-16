@@ -29,6 +29,13 @@ from .postprocess import registry as pp_registry
 from .render.chapters import assemble_chapters, render_chapter
 from .render.export import write_exports
 from .render.package import build_epub, render_cover_jpeg
+from .render.typography import (
+    apply_typography_fixes,
+    load_qc_fixes,
+)
+from .render.typography import (
+    build_vocab as _build_typography_vocab,
+)
 from .structure.pdf_based import (
     estimate_global_body_size,
 )
@@ -338,8 +345,62 @@ def _arabic_dominant(text: str) -> bool:
 # coverage is always 0. It is also a no-op for the Vision engine; we only
 # wire it in for Tesseract.
 _AR_DIACRITICS_RE = re.compile(r"[\u064b-\u065f\u0670\u06d6-\u06ed]")
+
+# --- thresholds for the line-level embedded-text hallucination filter ---
+#
+# We filter at the line level (BEFORE clustering into blocks) because the
+# block-level filter cannot split clusters that bundle a hallucinated page
+# header / footnote with adjacent real Arabic prose: the real text dominates
+# the cluster's average confidence and an "any diacritic" check skips the
+# whole block, even though some of its constituent lines are pure noise.
+#
+# A line is dropped when **all** of:
+#   - it sits geometrically over text the PDF's embedded layer marks as
+#     English (>= 50 % horizontal coverage at the line's y-range);
+#   - one of these fingerprints fires:
+#       (a) confidence < 35 AND diacritic density < 5 % (very low conf is
+#           almost always reversed-Latin noise UNLESS it's a heavily
+#           diacritised classical Arabic passage that the engine just had
+#           trouble reading — 5 % diacritic density is comfortably below
+#           normal classical-Arabic density of 15-25 %, so this protects
+#           real prose without weakening the hallucination guard).
+#       (b) confidence < 50 AND no Arabic diacritics
+#       (c) confidence < 50 AND high ASCII clutter (>= 20 % of arabic char
+#           count, capturing the digit-and-bracket signature of bibliography
+#           hallucination)
+#       (d) confidence < 60 AND diacritic density < 3 % AND ascii clutter
+#           >= 10 % (catches mid-conf "fake diacritic" hallucinations like
+#           Tesseract reading "[alastu]" and emitting a sprinkled-diacritic
+#           Arabic mock-up of it).
+#
+# The geometric overlap requirement is the safety net: real Arabic prose
+# never overlays English-marked PDF regions (unless the embedded layer is
+# itself wrong, which Adobe / ABBYY rarely are for English).
 _EMBED_MIN_HORIZ_COV = 0.50
-_EMBED_MAX_CONF = 30.0
+_LINE_VERY_LOW_CONF = 35.0
+_LINE_LOW_CONF = 50.0
+_LINE_MID_CONF = 60.0
+_LINE_CLUTTER_HIGH = 0.20
+_LINE_CLUTTER_MID = 0.10
+_LINE_DIACRITIC_MIN_DENSITY = 0.03
+# Lines with high diacritic density (>= 5%) are protected from the
+# "very low confidence" reject: heavily-diacritised classical Arabic
+# can read at conf 20-35 when the scan is faded, but it's real text.
+_LINE_PROTECT_DIACRITIC_DENSITY = 0.05
+
+# --- thresholds for the (legacy) block-level embedded-text filter ---
+#
+# The line-level filter above does most of the work; the block filter is a
+# safety net for edge cases where lines were already clustered (no per-line
+# bbox preserved) but the cluster as a whole sits on embedded English at
+# low confidence. We raise the cap from 30 -> 45 because hallucinations in
+# the 30-45 conf band were slipping through (e.g. all-caps running headers
+# in the page margin being read RTL as Arabic-script and scoring ~38 conf),
+# and we replace the binary "any diacritic" check with a density threshold
+# (Tesseract sprinkles 1-2 fake diacritics into its hallucinations, which
+# trivially defeats a binary check).
+_EMBED_MAX_CONF = 45.0
+_EMBED_DIACRITIC_MIN_DENSITY = 0.03
 
 
 def _embedded_english_words(
@@ -416,34 +477,137 @@ def _block_horiz_coverage_on_english(
     return min(merged / width, 1.0)
 
 
+def _is_line_geometric_artifact(line: dict) -> bool:
+    """Return True for OCR "lines" that can only be a scan artifact.
+
+    Tesseract's RTL pass occasionally outputs a tall, thin column of
+    garbage at the scan's binding / spine / page edge: a 10pt-wide,
+    200pt-tall "line" of low-confidence Arabic glyphs that is in fact
+    the dark gutter of a book scan being misread as text. Real text
+    lines on this corpus run roughly 8-22pt tall and 100-400pt wide
+    (width-to-height ratio ≥ 5:1). Any "line" tall enough to span
+    multiple real lines but too narrow to hold a single word is
+    overwhelmingly likely to be a binding artifact, regardless of OCR
+    confidence or embedded-text overlap. The rule is purely geometric
+    and applies uniformly to all PDFs.
+    """
+    try:
+        width = float(line.get("x1", 0)) - float(line.get("x0", 0))
+        height = float(line.get("y1", 0)) - float(line.get("y0", 0))
+    except (TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0:
+        return False
+    # Tall + narrow: height substantially exceeds width AND width is
+    # less than ~40pt (less than the width of three real Arabic chars
+    # at 12pt body size). Real lines never look like this.
+    if height > width and width < 40.0:
+        return True
+    # Extreme aspect ratio in either direction is also suspicious.
+    if height > 0 and width / height < 0.5 and width < 60.0:
+        return True
+    return False
+
+
+def _ascii_clutter_count(text: str) -> int:
+    """ASCII letters / digits / punctuation embedded in an Arabic-glyph block.
+
+    Real Arabic prose rarely contains ASCII clutter: a typical body
+    paragraph or classical citation has zero ASCII chars. Hallucinations
+    over Latin glyphs almost always carry brackets, digits, periods,
+    commas — the typographical scaffolding of footnote / bibliography
+    text — because Tesseract's RTL pass is literally reading the
+    underlying English text right-to-left.
+    """
+    return sum(
+        1 for c in text
+        if c.isascii() and (c.isalnum() or c in "[](){}<>,.:;'\"!?-/\\|=+*")
+    )
+
+
+def _is_line_hallucination(
+    line: dict,
+    embedded_words: list[tuple[float, float, float, float]],
+) -> bool:
+    """Return True if a single OCR line looks like Tesseract hallucinating
+    Arabic glyphs over text the PDF's embedded layer marks as English.
+
+    Runs BEFORE clustering so that a hallucinated page header / footnote
+    bundled with adjacent real Arabic prose can be dropped without
+    discarding the real text. See the threshold constants at the top of
+    this module for the rationale behind each fingerprint.
+    """
+    if not embedded_words:
+        return False
+    text = line.get("text", "") or ""
+    if not text.strip():
+        return False
+    ar_chars = sum(1 for c in text if _AR_RE.match(c))
+    if ar_chars == 0:
+        return False
+
+    horiz_cov = _block_horiz_coverage_on_english(line, embedded_words)
+    if horiz_cov < _EMBED_MIN_HORIZ_COV:
+        return False
+
+    conf = line.get("conf", 0)
+    if 0 < conf <= 1:
+        conf = conf * 100
+
+    diacritics = len(_AR_DIACRITICS_RE.findall(text))
+    diacritic_density = diacritics / max(ar_chars, 1)
+    clutter = _ascii_clutter_count(text)
+    clutter_ratio = clutter / max(ar_chars, 1)
+
+    # (a) very-low-conf line over embedded English → reject, UNLESS the
+    #     line has substantial diacritic density (heavily diacritised
+    #     classical Arabic is real text, even at conf 25-30 on a faded
+    #     scan).
+    if (
+        conf < _LINE_VERY_LOW_CONF
+        and diacritic_density < _LINE_PROTECT_DIACRITIC_DENSITY
+    ):
+        return True
+    # (b) low-conf line over embedded English with no diacritics at all.
+    if conf < _LINE_LOW_CONF and diacritics == 0:
+        return True
+    # (c) low-conf line over embedded English with heavy ASCII clutter.
+    if conf < _LINE_LOW_CONF and clutter_ratio >= _LINE_CLUTTER_HIGH:
+        return True
+    # (d) mid-conf line over embedded English with sparse fake diacritics
+    #     AND some ASCII clutter. Catches Tesseract's "fake-diacritic
+    #     hallucination" mode where it sprinkles 1-2 tashkeel marks into
+    #     a stream of reversed Latin to evade a binary diacritic gate.
+    if (
+        conf < _LINE_MID_CONF
+        and diacritic_density < _LINE_DIACRITIC_MIN_DENSITY
+        and clutter_ratio >= _LINE_CLUTTER_MID
+    ):
+        return True
+    return False
+
+
 def _is_embedded_text_hallucination(
     block: dict,
     embedded_words: list[tuple[float, float, float, float]],
 ) -> bool:
-    """Return True if the block looks like Tesseract hallucinating Arabic
-    glyphs over text the PDF's embedded layer marks as English.
+    """Block-level safety net behind :func:`_is_line_hallucination`.
 
-    All three conditions must hold:
+    Conditions (all must hold):
 
-    1. ``conf < 30`` — Tesseract is unsure about the glyphs (real Arabic
-       in this corpus reliably scores ≥ 25; hallucination over Latin
-       glyphs hovers in the 15-28 range).
-    2. The block's text contains **no** Arabic diacritics (tashkeel).
-       Religious / classical Arabic text — the dominant Arabic content
-       in books that need this filter — is heavily diacritised; a block
-       of "Arabic" prose with zero tashkeel is almost always either
-       mojibake or correctly recognised modern Arabic at much higher
-       confidence. Either way, combined with the other two signals it's
-       a clean reject.
-    3. The block's horizontal extent is ≥ 50 % covered by embedded
-       English word bboxes at the same y-position — the PDF's prior
-       OCR (ABBYY / Adobe / similar) is asserting that those pixels are
-       English text, not Arabic.
+    1. ``conf < 45`` — Tesseract is at most moderately sure. Raised from
+       the original 30 because we observed hallucinated page headers
+       (page numbers + all-caps title lines in scan margins) scoring
+       35-42 conf when read RTL as Arabic.
+    2. Arabic-diacritic density below 3 %. We do **not** use a binary
+       "has-any-diacritic" gate: Tesseract sprinkles 1-2 fake tashkeel
+       marks into hallucinated reversed-Latin chains, trivially
+       defeating the binary check. Real classical Arabic prose runs at
+       5-10 % diacritic density on this corpus.
+    3. Horizontal coverage on embedded English ≥ 50 %.
 
-    The conjunction is what makes this filter safe: any one of the
-    three alone has too many false positives. For PDFs without an
-    embedded text layer (pure scans) condition 3 is never satisfied
-    and the filter is a silent no-op.
+    Safety: for PDFs without an embedded text layer (pure scans),
+    ``embedded_words`` is empty and the filter is a silent no-op.
     """
     if not embedded_words:
         return False
@@ -452,7 +616,12 @@ def _is_embedded_text_hallucination(
         conf = conf * 100
     if conf >= _EMBED_MAX_CONF:
         return False
-    if _AR_DIACRITICS_RE.search(block.get("text", "")):
+    text = block.get("text", "") or ""
+    ar_chars = sum(1 for c in text if _AR_RE.match(c))
+    if ar_chars == 0:
+        return False
+    diacritics = len(_AR_DIACRITICS_RE.findall(text))
+    if diacritics / max(ar_chars, 1) >= _EMBED_DIACRITIC_MIN_DENSITY:
         return False
     return (
         _block_horiz_coverage_on_english(block, embedded_words)
@@ -686,9 +855,12 @@ def _ocr_pages_for(
     suppressed_pages = 0
     embed_drop_chars = 0
     embed_drop_blocks = 0
+    line_drop_count = 0
+    line_drop_chars = 0
     # Open the source PDF once so we can read its embedded text layer
-    # for the block-level hallucination filter. We close it after the
-    # loop. For Vision builds we don't need it and skip the open.
+    # for the line- and block-level hallucination filters. We close it
+    # after the loop. For Vision builds we don't need it and skip the
+    # open.
     embed_doc = None
     if embed_suppress:
         try:
@@ -700,6 +872,47 @@ def _ocr_pages_for(
             if b.get("conf", 0) <= 1.0:
                 b["conf"] = b["conf"] * 100
         ar_lines = [L for L in p.get("ar_lines", []) if _arabic_dominant(L["text"])]
+
+        # Geometric artifact filter (Tesseract only): drop OCR "lines" that
+        # are tall-thin scan binding / page-edge regions. Runs unconditionally
+        # (doesn't need an embedded text layer).
+        if embed_suppress and ar_lines:
+            before = len(ar_lines)
+            ar_lines = [L for L in ar_lines if not _is_line_geometric_artifact(L)]
+            geom_drop = before - len(ar_lines)
+            if geom_drop:
+                line_drop_count += geom_drop
+                # We approximate: assume each artifact line contributed its
+                # full text length (cheap, since we already filtered).
+                # (Not used downstream beyond logging.)
+
+        # Line-level embedded-text hallucination filter (Tesseract only).
+        # Runs BEFORE clustering so that a hallucinated page-header line
+        # bundled with an adjacent real-Arabic citation line can be
+        # dropped without losing the real text. See
+        # :func:`_is_line_hallucination`.
+        if embed_suppress and embed_doc is not None and ar_lines:
+            pno = p.get("pno")
+            page_idx = (pno - 1) if isinstance(pno, int) and pno >= 1 else None
+            embedded_for_lines: list[tuple[float, float, float, float]] = []
+            if page_idx is not None and 0 <= page_idx < len(embed_doc):
+                embedded_for_lines = _embedded_english_words(embed_doc, page_idx)
+            if embedded_for_lines:
+                kept_lines = []
+                for L in ar_lines:
+                    if _is_line_hallucination(L, embedded_for_lines):
+                        line_drop_count += 1
+                        line_drop_chars += sum(
+                            1 for c in L.get("text", "") if _AR_RE.match(c)
+                        )
+                    else:
+                        kept_lines.append(L)
+                ar_lines = kept_lines
+                # Also persist the filtered ar_lines on the page so
+                # downstream consumers (e.g. structure_page_vision)
+                # don't see the dropped lines.
+                p["ar_lines"] = ar_lines
+
         if ar_lines:
             heights = [L["y1"] - L["y0"] for L in ar_lines if L["y1"] > L["y0"]]
             avg_h = statistics.median(heights) if heights else 14.0
@@ -712,12 +925,9 @@ def _ocr_pages_for(
             )
         else:
             p["arabic_blocks"] = []
-        # Block-level embedded-text hallucination filter: for Tesseract
-        # builds on PDFs with a prior OCR text layer (ABBYY / Adobe /
-        # similar), drop Arabic blocks whose pixels the embedded layer
-        # already marks as English at low Tesseract confidence and with
-        # no Arabic diacritics. See
-        # :func:`_is_embedded_text_hallucination` for the rationale.
+        # Block-level embedded-text hallucination filter: safety net for
+        # clusters the line-level filter missed (e.g. a block where
+        # surviving lines happen to align with embedded English).
         if embed_suppress and embed_doc is not None and p["arabic_blocks"]:
             pno = p.get("pno")
             page_idx = (pno - 1) if isinstance(pno, int) and pno >= 1 else None
@@ -748,11 +958,17 @@ def _ocr_pages_for(
             suppressed_pages += 1
     if embed_doc is not None:
         embed_doc.close()
+    if embed_suppress and line_drop_count:
+        log(
+            f"suppressed {line_drop_count} Arabic line(s) ({line_drop_chars} chars) "
+            f"pre-clustering that hallucinated over embedded-English text "
+            f"(Tesseract line-level guard)"
+        )
     if embed_suppress and embed_drop_blocks:
         log(
             f"suppressed {embed_drop_blocks} Arabic block(s) ({embed_drop_chars} chars) "
-            f"that overlay embedded-English text at low confidence "
-            f"(Tesseract hallucination guard)"
+            f"post-clustering that overlay embedded-English text at low confidence "
+            f"(Tesseract block-level guard)"
         )
     if bib_suppress and suppressed_pages:
         log(f"suppressed Arabic on {suppressed_pages} bibliography-like pages (Tesseract hallucination guard)")
@@ -1024,11 +1240,30 @@ def _build_book_with_doc(
             emitted_pp_total |= emitted
         log(f"  {len(emitted_pp_total)} unique printed-page anchors")
 
-        # 9. Cover
+        # 9. Post-render typography fixes.
+        # These operate on the rendered XHTML, where OCR / typesetting
+        # artifacts surface only after footnote refs are inlined:
+        #   - hyphen-across-line-break stitching
+        #   - loose footnote-digit -> Unicode superscript
+        #   - stray footnote-quote stripping (Name" verb, word." Next)
+        #   - per-book qc_fixes.toml HTML-layer substitutions
+        # See quire.render.typography for the full safety contract.
+        qc_fixes = load_qc_fixes(cfg.qc_fixes_path)
+        vocab_text = "\n".join(html for _slug, html in rendered)
+        vocab = _build_typography_vocab(vocab_text)
+        rendered, typo_report = apply_typography_fixes(
+            rendered, vocab=vocab, qc_fixes=qc_fixes,
+        )
+        log(f"  {typo_report.summary_line()}")
+        if typo_report.hyphen_examples:
+            for ex in typo_report.hyphen_examples[:5]:
+                log(f"    hyphen: {ex}")
+
+        # 10. Cover
         cover_jpeg = cfg.caches_dir / "cover.jpg"
         render_cover_jpeg(str(cfg.pdf_path), str(cover_jpeg), page_index=cfg.cover_pdf_page - 1)
 
-        # 10. Package EPUB
+        # 11. Package EPUB
         log("packaging EPUB")
         build_epub(
             cfg=cfg,
