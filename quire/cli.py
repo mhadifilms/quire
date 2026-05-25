@@ -73,6 +73,31 @@ def _cmd_render_pages(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_preprocess(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from .extract.spreads import split_pdf
+
+    pdf_path = Path(args.pdf)
+    if not pdf_path.exists():
+        print(f"error: {pdf_path} does not exist", file=sys.stderr)
+        return 2
+    out_dir = Path(args.out)
+    paths = split_pdf(
+        pdf_path,
+        out_dir,
+        dpi=args.dpi,
+        rotate=not args.no_rotate,
+        detect_spreads=not args.no_split,
+        outer_margin=args.outer_margin,
+        inner_trim=args.inner_trim,
+        image_format=args.format,
+        image_quality=args.quality,
+    )
+    print(f"wrote {len(paths)} page(s) to {out_dir}")
+    return 0
+
+
 def _cmd_qc(args: argparse.Namespace) -> int:
     """Run AI-assisted page-by-page QC against the rendered EPUB content.
 
@@ -224,6 +249,27 @@ def main(argv: list[str] | None = None) -> int:
     p_render.add_argument("book", help="Book slug or folder path.")
     p_render.add_argument("--dpi", type=int, default=160)
     p_render.set_defaults(func=_cmd_render_pages)
+
+    p_pre = sub.add_parser(
+        "preprocess",
+        help="Detect rotation + two-page spreads in a PDF and split into single upright pages.",
+    )
+    p_pre.add_argument("pdf", help="Path to the source PDF.")
+    p_pre.add_argument("--out", required=True,
+                       help="Output directory for per-page images.")
+    p_pre.add_argument("--dpi", type=int, default=200)
+    p_pre.add_argument("--no-rotate", action="store_true",
+                       help="Skip auto-rotation detection.")
+    p_pre.add_argument("--no-split", action="store_true",
+                       help="Skip spread-splitting (treat every PDF page as a single page).")
+    p_pre.add_argument("--outer-margin", type=int, default=0,
+                       help="Pixels to trim from the outer (non-binding) edge of each split page.")
+    p_pre.add_argument("--inner-trim", type=int, default=0,
+                       help="Pixels to trim from the binding edge to drop ring shadows.")
+    p_pre.add_argument("--format", choices=["jpeg", "png"], default="jpeg")
+    p_pre.add_argument("--quality", type=int, default=88,
+                       help="JPEG quality 1-100 (ignored for PNG).")
+    p_pre.set_defaults(func=_cmd_preprocess)
 
     p_qc = sub.add_parser(
         "qc",

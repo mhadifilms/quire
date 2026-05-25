@@ -33,6 +33,31 @@ from ..io_utils import atomic_write_bytes, content_fingerprint
 _QUIRE_NS = uuid.UUID("8b0f9c8a-2b8e-5d9f-9f1c-001100110011")
 
 
+# RFC 8081 font media types (EPUB 3.2+). Some readers (notably Apple Books)
+# silently drop fonts declared with the wrong container type — e.g. a .ttf
+# tagged as ``application/vnd.ms-opentype`` will not load, leaving any glyph
+# the reader's default fonts lack rendering as tofu boxes. Map by extension.
+_FONT_MEDIA_TYPES: dict[str, str] = {
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".ttc": "font/collection",
+    ".otc": "font/collection",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+}
+
+
+def font_media_type(path: Path) -> str:
+    """Return the EPUB-compliant media-type for an embedded font path.
+
+    Falls back to the legacy ``application/font-sfnt`` for unrecognized
+    extensions so old EPUB 3.0 readers still parse the manifest, but new
+    builds will use the RFC 8081 ``font/*`` types that modern readers
+    (Apple Books, Thorium, Kobo) expect.
+    """
+    return _FONT_MEDIA_TYPES.get(path.suffix.lower(), "application/font-sfnt")
+
+
 def _stable_book_id(cfg: BookConfig) -> str:
     """Deterministic urn-uuid for the book.
 
@@ -325,7 +350,7 @@ def render_opf(
     for path, *_ in fonts:
         item_id = "font-" + path.name.replace(".", "-").lower()
         manifest_items.append(
-            f'    <item id="{item_id}" href="fonts/{path.name}" media-type="application/font-sfnt" />'
+            f'    <item id="{item_id}" href="fonts/{path.name}" media-type="{font_media_type(path)}" />'
         )
 
     for c in chapters:

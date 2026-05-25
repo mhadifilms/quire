@@ -8,7 +8,7 @@ from pathlib import Path
 from quire.config import load_book_config
 from quire.pipeline import build_book
 from quire.render.chapters import _disambiguate_slug
-from quire.render.package import _stable_book_id
+from quire.render.package import _stable_book_id, font_media_type
 
 
 def test_stable_book_id_is_deterministic(text_engine_book: Path, tmp_path: Path) -> None:
@@ -32,6 +32,20 @@ def test_stable_book_id_changes_with_pdf_content(text_engine_book: Path, tmp_pat
     doc.close()
     cfg2 = load_book_config(text_engine_book, repo_root=tmp_path)
     assert _stable_book_id(cfg2) != base
+
+
+def test_font_media_type_maps_known_extensions() -> None:
+    assert font_media_type(Path("/x/Foo.ttf")) == "font/ttf"
+    assert font_media_type(Path("/x/Foo.TTF")) == "font/ttf"  # case-insensitive
+    assert font_media_type(Path("/x/Foo.otf")) == "font/otf"
+    assert font_media_type(Path("/x/Foo.ttc")) == "font/collection"
+    assert font_media_type(Path("/x/Foo.woff")) == "font/woff"
+    assert font_media_type(Path("/x/Foo.woff2")) == "font/woff2"
+
+
+def test_font_media_type_falls_back_on_unknown_extension() -> None:
+    # Unknown extension uses the legacy EPUB 3.0 value so old readers still parse.
+    assert font_media_type(Path("/x/Foo.weird")) == "application/font-sfnt"
 
 
 def test_disambiguate_slug_suffixes_collisions() -> None:
