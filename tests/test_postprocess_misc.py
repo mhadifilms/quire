@@ -52,6 +52,30 @@ def test_mojibake_preserves_normal_text() -> None:
     assert pages[0]["elements"][0]["text"] == "Perfectly fine English."
 
 
+def test_mojibake_preserves_stares_as_valid_english() -> None:
+    pages = [{"elements": [
+        {
+            "kind": "paragraph",
+            "text": "Barnaby stares at the clouds. She stares into the shell.",
+            "y": 1,
+        }
+    ]}]
+    mojibake.post_structure(_Cfg(), pages)
+    assert pages[0]["elements"][0]["text"] == (
+        "Barnaby stares at the clouds. She stares into the shell."
+    )
+
+
+def test_mojibake_preserves_pronouns_in_comma_clause() -> None:
+    text = '"I can’t. Please, please don’t leave me here."'
+    pages = [{"elements": [{"kind": "paragraph", "text": text, "y": 1}]}]
+
+    mojibake.post_structure(_Cfg(), pages)
+
+    assert pages[0]["elements"][0]["text"] == text
+    assert "[Arabic]" not in pages[0]["elements"][0]["text"]
+
+
 # ---------- Pass-2 cue regex conservatism (regression guards) ----------
 #
 # The cue regex matches sentence shapes like ``, X is the …``. Before the

@@ -22,6 +22,7 @@ Output is the same shape that ``chapters.py`` / ``render_chapter`` expects.
 
 from __future__ import annotations
 
+import difflib
 import re
 import statistics
 from dataclasses import dataclass
@@ -109,10 +110,12 @@ def line_format_for(line: dict, pdf_spans: list[dict]) -> dict:
     """Aggregate format flags from PDF spans whose Y range overlaps this
     Vision line. Returns dict with 'italic_words', 'bold_words', 'size'.
     """
+    x0, x1 = line["x0"], line["x1"]
     y0, y1 = line["y0"], line["y1"]
     overlap_spans = [
         s for s in pdf_spans
         if _y_overlap(y0, y1, s["y0"], s["y1"]) >= (y1 - y0) * 0.4
+        and _y_overlap(x0, x1, s["x0"], s["x1"]) > 0
     ]
     italic_words: set[str] = set()
     bold_words: set[str] = set()
@@ -213,10 +216,21 @@ def find_footnote_y_threshold(
             last.append(s)
         else:
             lines.append([s])
-    line_summaries = [
-        {"y": min(L[0]["y0"], min(s["y0"] for s in L)), "med": statistics.median([s["size"] for s in L])}
-        for L in lines
-    ]
+    line_summaries = []
+    for line in lines:
+        # Weight font sizes by visible character count. Some scan-produced
+        # text layers split individual letters into tiny fallback-font spans;
+        # an unweighted span median mistakes those body lines for footnotes.
+        weighted_sizes: list[float] = []
+        for span in line:
+            weight = max(1, len(re.findall(r"[A-Za-z0-9]", span["text"])))
+            weighted_sizes.extend([span["size"]] * weight)
+        line_summaries.append(
+            {
+                "y": min(span["y0"] for span in line),
+                "med": statistics.median(weighted_sizes),
+            }
+        )
     # Find first line where median <= threshold AND next line also small.
     for i in range(len(line_summaries) - 1):
         if line_summaries[i]["med"] <= threshold and line_summaries[i + 1]["med"] <= threshold:
@@ -308,6 +322,17 @@ def _prefer_secondary_ocr(primary: list[dict], secondary: list[dict]) -> list[di
         for cand in secondary_sorted:
             if abs(cand["y0"] - line["y0"]) > 2.5:
                 continue
+            # On multi-column pages and scanned spreads, unrelated lines
+            # frequently share a baseline. A secondary OCR candidate must
+            # overlap the primary line horizontally; Y proximity alone can
+            # replace left-page prose with right-page prose and duplicate it.
+            overlap_x = _y_overlap(line["x0"], line["x1"], cand["x0"], cand["x1"])
+            min_width = min(
+                max(1.0, line["x1"] - line["x0"]),
+                max(1.0, cand["x1"] - cand["x0"]),
+            )
+            if overlap_x / min_width < 0.50:
+                continue
             ctext = cand.get("text", "")
             if has_arabic(text) or has_arabic(ctext):
                 continue
@@ -324,6 +349,116 @@ def _prefer_secondary_ocr(primary: list[dict], secondary: list[dict]) -> list[di
                 repl["text"] = ctext
                 break
         out.append(repl or line)
+    return out
+
+
+def _line_ocr_penalty(text: str) -> int:
+    """Score obvious OCR damage in an English line (lower is better)."""
+    penalty = 0
+    words = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", text)
+    for word in words:
+        bare = word.replace("’", "'")
+        # Mixed case inside a word is almost always OCR damage (``cauTIoN``).
+        if (
+            len(bare) >= 4
+            and any(c.islower() for c in bare)
+            and any(c.isupper() for c in bare[1:])
+        ):
+            penalty += 3
+        if bare in {"T'll", "T’d", "T'd"}:
+            penalty += 3
+        lower = bare.lower()
+        if len(lower) >= 4 and not _is_known_english(lower):
+            # Capitalised names are allowed; score ordinary unknown words.
+            if not bare[:1].isupper():
+                penalty += 1
+    penalty += sum(text.count(char) for char in "_|~©°")
+    # Opening quote swallowed the closing quote before a dialogue tag.
+    if re.search(r'^["“][^"”]+,\s+(?:he|she|they|[A-Z][a-z]+)\s', text):
+        penalty += 3
+    return penalty
+
+
+def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict]:
+    """Replace a primary line only when an aligned fallback is clearly cleaner.
+
+    This is intentionally asymmetric: the configured engine remains canonical.
+    A fallback line wins only when geometry strongly matches and generic
+    lexical/typographic evidence shows less OCR damage.
+    """
+    if not fallback:
+        return primary
+    candidates = sorted(fallback, key=lambda line: line["y0"])
+    out: list[dict] = []
+    for line in primary:
+        best = None
+        best_penalty = _line_ocr_penalty(line.get("text", ""))
+        for cand in candidates:
+            if abs(cand["y0"] - line["y0"]) > 7.5:
+                continue
+            overlap_x = _y_overlap(line["x0"], line["x1"], cand["x0"], cand["x1"])
+            min_width = min(
+                max(1.0, line["x1"] - line["x0"]),
+                max(1.0, cand["x1"] - cand["x0"]),
+            )
+            if overlap_x / min_width < 0.70:
+                continue
+            cand_text = cand.get("text", "")
+            similarity = difflib.SequenceMatcher(
+                None,
+                line.get("text", "").lower(),
+                cand_text.lower(),
+                autojunk=False,
+            ).ratio()
+            if similarity < 0.55:
+                continue
+            cand_penalty = _line_ocr_penalty(cand_text)
+
+            # Resolve a hyphenated word using the next line as dictionary
+            # evidence (``mor-`` + ``ing`` vs fallback ``mov-`` + ``ing``).
+            primary_match = re.search(r"([A-Za-z]{2,})-\s*$", line.get("text", ""))
+            cand_match = re.search(r"([A-Za-z]{2,})-\s*$", cand_text)
+            if primary_match and cand_match:
+                same_column_followers = [
+                    other
+                    for other in primary
+                    if other["y0"] > line["y0"]
+                    and _y_overlap(
+                        line["x0"], line["x1"], other["x0"], other["x1"]
+                    ) / min(
+                        max(1.0, line["x1"] - line["x0"]),
+                        max(1.0, other["x1"] - other["x0"]),
+                    ) >= 0.70
+                ]
+                next_line = min(
+                    same_column_followers,
+                    key=lambda other: other["y0"],
+                    default=None,
+                )
+                suffix = re.match(
+                    r"\s*([a-z]{2,})",
+                    next_line.get("text", "") if next_line else "",
+                )
+                if suffix:
+                    primary_joined = primary_match.group(1) + suffix.group(1)
+                    cand_joined = cand_match.group(1) + suffix.group(1)
+                    if (
+                        not _is_known_english(primary_joined)
+                        and _is_known_english(cand_joined)
+                    ):
+                        cand_penalty -= 3
+
+            conf = _line_conf_percent(cand)
+            if cand_penalty < best_penalty and (conf < 0 or conf >= 85):
+                best = cand
+                best_penalty = cand_penalty
+        if best is None:
+            out.append(line)
+        else:
+            replacement = dict(line)
+            replacement["text"] = best["text"]
+            replacement["conf"] = best.get("conf", line.get("conf", -1))
+            out.append(replacement)
     return out
 
 
@@ -471,6 +606,82 @@ def merge_same_y_lines(lines: list[dict], y_tol: float = 4.0) -> list[dict]:
         out.append(merged)
     out.sort(key=lambda L: L["y0"])
     return out
+
+
+def detect_spread_columns(
+    lines: list[dict],
+    page_width: float,
+    page_height: float,
+) -> tuple[list[dict], list[dict], float] | None:
+    """Detect a scanned two-page spread and return its reading columns.
+
+    A spread has two dense text regions separated by a clear gutter near the
+    horizontal centre.  Detecting this before :func:`merge_same_y_lines` is
+    essential: otherwise lines from the two printed pages that share a
+    baseline are concatenated and can no longer be separated.
+
+    The test is deliberately conservative so ordinary portrait pages,
+    centred title pages, and wide single-column layouts remain untouched.
+    """
+    meaningful = [
+        line
+        for line in lines
+        if len(line.get("text", "").strip()) >= 3
+        and line.get("x1", 0) > line.get("x0", 0)
+    ]
+    if len(meaningful) < 16 or page_width < page_height * 1.12:
+        return None
+
+    best: tuple[float, list[dict], list[dict], float] | None = None
+    for step in range(31):
+        gutter = page_width * (0.35 + step * 0.01)
+        left = [line for line in meaningful if line["x1"] <= gutter]
+        right = [line for line in meaningful if line["x0"] >= gutter]
+        crossing = [
+            line for line in meaningful
+            if line["x0"] < gutter < line["x1"]
+        ]
+        if len(left) < 6 or len(right) < 6:
+            continue
+        if len(crossing) > max(1, round(len(meaningful) * 0.03)):
+            continue
+
+        left_edge = max(line["x1"] for line in left)
+        right_edge = min(line["x0"] for line in right)
+        gap = right_edge - left_edge
+        if gap < page_width * 0.025:
+            continue
+        balance = min(len(left), len(right)) / max(len(left), len(right))
+        if balance < 0.20:
+            continue
+        # Prefer the widest whitespace gap, then balanced column density.
+        score = gap / page_width + balance * 0.05
+        if best is None or score > best[0]:
+            best = (score, left, right, (left_edge + right_edge) / 2)
+
+    if best is None:
+        return None
+    _, left, right, gutter = best
+    return (
+        sorted(left, key=lambda line: (line["y0"], line["x0"])),
+        sorted(right, key=lambda line: (line["y0"], line["x0"])),
+        gutter,
+    )
+
+
+def _is_bottom_page_number(
+    line: dict,
+    *,
+    page_height: float,
+    column_left: float,
+    column_right: float,
+) -> bool:
+    """Return True for a standalone printed page number in the footer."""
+    if line["y0"] < page_height * 0.80:
+        return False
+    if not re.fullmatch(r"\s*\d{1,4}\s*", line.get("text", "")):
+        return False
+    return column_left <= (line["x0"] + line["x1"]) / 2 <= column_right
 
 
 # ---------- footnote marker detection ----------
@@ -733,7 +944,7 @@ def _strip_footnote_markers(text: str) -> tuple[str, list[int]]:
         c = text[i]
         prev = text[i - 1] if i > 0 else ""
         # Case A: direct digit superscript marker (Vision usually saw it).
-        if c.isdigit() and prev in '."\')]':
+        if c.isdigit() and prev and prev in '."\')]':
             seq += 1
             out.append(f"{PLACEHOLDER_FN}{seq}{PLACEHOLDER_FN}")
             i += 1
@@ -811,6 +1022,8 @@ def vision_lines_to_paragraphs(
     body_size: float,
     body_left: float,
     body_right: float,
+    *,
+    recover_footnote_markers: bool = True,
 ) -> list[Para]:
     if not lines:
         return []
@@ -864,7 +1077,8 @@ def vision_lines_to_paragraphs(
         text_with_em = _apply_italics(text_for_format, italic_words)
         # Footnote markers: convert digit suffixes after punctuation into
         # placeholders.
-        text_with_em, _ = _strip_footnote_markers(text_with_em)
+        if recover_footnote_markers:
+            text_with_em, _ = _strip_footnote_markers(text_with_em)
 
         x0 = L["x0"]
         indented = (x0 - body_left) > avg_h * 0.6
@@ -1023,7 +1237,24 @@ def _fix_split_cursive_markers(text: str) -> str:
 
 
 def _rejoin_hyphenation(text: str) -> str:
-    text = re.sub(r"-\s+", lambda m: "" if m.start() > 0 and text[m.start() - 1].islower() else m.group(0), text)
+    def join_or_keep(match: re.Match) -> str:
+        left = match.group(1)
+        right = match.group(2)
+        joined = left + right
+        if _is_known_english(joined):
+            return joined
+        # If both halves are real words, the printed hyphen is semantic
+        # (``fourth-grade``), not a line-wrap artifact.
+        if _is_known_english(left) and _is_known_english(right):
+            return left + "-" + right
+        return joined
+
+    text = re.sub(r"\b([A-Za-z]{2,})-\s+([a-z]{2,})\b", join_or_keep, text)
+    text = re.sub(
+        r"[—–-]{2,}",
+        lambda match: "—" if "—" in match.group(0) else match.group(0),
+        text,
+    )
     text = re.sub(r"\u00ad", "", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -1362,19 +1593,41 @@ def structure_page_vision(
         list(vision_page.get("en_lines", [])),
         list(vision_page.get("ar_lines", [])),
     )
-    # Drop running header. Two passes:
-    #   1. Anything in the top 60pt is always header / margin noise.
-    #   2. Within the top 100pt, drop a line that looks like a running
-    #      header. We only flag it as such when the line carries BOTH an
-    #      all-caps title AND a trailing page number (e.g. "TAWAF 89") —
-    #      that combination doesn't appear in real chapter titles, but is
-    #      the standard running-header layout.
+    en_lines = _prefer_fallback_ocr(
+        en_lines,
+        list(vision_page.get("fallback_en_lines", [])),
+    )
+    # Drop running headers using centred title geometry or the conventional
+    # all-caps-title + page-number form. Do not blanket-drop top-margin lines:
+    # a scanned spread's right page often begins body prose near y=40.
     def _is_running_header(L: dict) -> bool:
         if L["y0"] >= 100:
             return False
         t = L["text"].strip()
         if not t:
             return True
+        # Common fiction/book running headers are short title strings centred
+        # over either half of a scanned spread, without a page number.
+        if L["y0"] < 70:
+            width = L["x1"] - L["x0"]
+            centre = (L["x0"] + L["x1"]) / 2
+            near_page_centre = min(
+                abs(centre - pw * 0.25),
+                abs(centre - pw * 0.75),
+            ) < pw * 0.12
+            words = re.findall(r"[A-Za-z]+", t)
+            title_case_ratio = (
+                sum(word[:1].isupper() for word in words) / len(words)
+                if words else 0.0
+            )
+            known_title = normalize_known_title(t) is not None
+            if (
+                width < pw * 0.35
+                and near_page_centre
+                and len(t) <= 60
+                and (known_title or title_case_ratio >= 0.60)
+            ):
+                return True
         m = re.search(r"^(.+?)\s+(\d{1,3})\s*$", t)
         if not m:
             return False
@@ -1384,14 +1637,43 @@ def structure_page_vision(
             return False
         return all(c.isupper() for c in letters)
 
-    en_lines = [L for L in en_lines if L["y0"] >= 60 and not _is_running_header(L)]
+    en_lines = [L for L in en_lines if not _is_running_header(L)]
 
-    # Merge fragments that share a baseline (Vision splits TOC entries into
-    # title + page-number fragments separated by long whitespace).
-    en_lines = merge_same_y_lines(en_lines)
+    # Detect two-page scans before merging same-baseline fragments. Merging
+    # across a spread's gutter irreversibly interleaves the printed pages.
+    spread = detect_spread_columns(en_lines, pw, ph)
+    spread_gutter = spread[2] if spread else None
+    raw_line_groups = [spread[0], spread[1]] if spread else [en_lines]
+    line_groups: list[list[dict]] = []
+    for group in raw_line_groups:
+        if group:
+            col_left = min(line["x0"] for line in group)
+            col_right = max(line["x1"] for line in group)
+            group = [
+                line
+                for line in group
+                if not _is_bottom_page_number(
+                    line,
+                    page_height=ph,
+                    column_left=col_left,
+                    column_right=col_right,
+                )
+            ]
+        # Vision splits a visual line into adjacent fragments. Merge only
+        # within the detected printed page / reading column.
+        line_groups.append(merge_same_y_lines(group))
 
-    body_lines = [L for L in en_lines if not is_footnote_line(L, fn_y0)]
-    fn_lines = [L for L in en_lines if is_footnote_line(L, fn_y0)]
+    body_line_groups = [
+        [line for line in group if not is_footnote_line(line, fn_y0)]
+        for group in line_groups
+    ]
+    fn_line_groups = [
+        [line for line in group if is_footnote_line(line, fn_y0)]
+        for group in line_groups
+    ]
+    en_lines = [line for group in line_groups for line in group]
+    body_lines = [line for group in body_line_groups for line in group]
+    fn_lines = [line for group in fn_line_groups for line in group]
     centered_footer_lines: list[dict] = []
 
     # A lone bottom citation can be missed by the font-size threshold when the
@@ -1414,13 +1696,13 @@ def structure_page_vision(
         fn_y0 = ph * 1.1
         body_lines = list(en_lines)
         fn_lines = []
-    centered_imprint = _looks_like_centered_imprint_page(body_lines, pw)
+    centered_imprint = not spread and _looks_like_centered_imprint_page(body_lines, pw)
     centered_title_credits = False
     if centered_imprint:
         body_lines = _drop_margin_noise_on_centered_page(body_lines, pw)
         for L in body_lines:
             L["text"] = _frontmatter_clean(L["text"])
-    elif _looks_like_centered_title_credits_page(body_lines, pw):
+    elif not spread and _looks_like_centered_title_credits_page(body_lines, pw):
         centered_title_credits = True
         for L in body_lines:
             L["text"] = _frontmatter_clean(L["text"])
@@ -1431,22 +1713,81 @@ def structure_page_vision(
         centered_footer_lines = list(fn_lines)
         fn_lines = []
 
-    # Body left/right margins from body lines
-    if body_lines:
-        body_left = min(L["x0"] for L in body_lines)
-        body_right = max(L["x1"] for L in body_lines)
-    else:
-        body_left, body_right = 60.0, pw - 60
-
-    # Compute paragraphs
-    paragraphs = [] if centered_imprint or centered_title_credits else vision_lines_to_paragraphs(
-        body_lines, pdf_spans, body_size, body_left, body_right
-    )
+    # Compute paragraphs. A scanned spread is two independent printed pages:
+    # reconstruct each one separately, then offset its ordering coordinate so
+    # the complete left page precedes the complete right page.
+    paragraphs: list[Para] = []
+    if not centered_imprint and not centered_title_credits:
+        paragraph_groups = body_line_groups if spread else [body_lines]
+        for column_index, group in enumerate(paragraph_groups):
+            if not group:
+                continue
+            body_left = min(line["x0"] for line in group)
+            body_right = max(line["x1"] for line in group)
+            if spread_gutter is None:
+                column_spans = pdf_spans
+            elif column_index == 0:
+                column_spans = [span for span in pdf_spans if span["x1"] <= spread_gutter]
+            else:
+                column_spans = [span for span in pdf_spans if span["x0"] >= spread_gutter]
+            column_paragraphs = vision_lines_to_paragraphs(
+                group,
+                column_spans,
+                body_size,
+                body_left,
+                body_right,
+                recover_footnote_markers=bool(fn_lines),
+            )
+            if spread:
+                offset = column_index * (ph + 1)
+                for paragraph in column_paragraphs:
+                    paragraph.y0 += offset
+                    paragraph.y1 += offset
+                # A printed paragraph can continue from the bottom of the
+                # left page to the top of the right page in the same scan.
+                if (
+                    paragraphs
+                    and column_paragraphs
+                    and not paragraphs[-1].heading
+                    and not column_paragraphs[0].heading
+                ):
+                    previous = paragraphs[-1]
+                    following = column_paragraphs[0]
+                    previous_complete = bool(
+                        re.search(r'[.!?]["’\')\]]?\s*$', previous.text)
+                    )
+                    following_continues = bool(
+                        re.match(r"\s*[a-z]", following.text)
+                    )
+                    if not previous_complete or following_continues:
+                        previous.text = _rejoin_hyphenation(
+                            previous.text + " " + following.text
+                        )
+                        previous.y1 = following.y1
+                        confs = [
+                            conf
+                            for conf in (previous.conf, following.conf)
+                            if conf >= 0
+                        ]
+                        previous.conf = statistics.mean(confs) if confs else -1.0
+                        column_paragraphs = column_paragraphs[1:]
+            paragraphs.extend(column_paragraphs)
 
     # Arabic blocks split by zone
     ar_blocks = list(vision_page.get("arabic_blocks", []))
     body_ar = [b for b in ar_blocks if (b["y0"] + b["y1"]) / 2 < fn_y0]
     fn_ar = [b for b in ar_blocks if (b["y0"] + b["y1"]) / 2 >= fn_y0]
+    if spread_gutter is not None:
+        # Preserve the same left-page-then-right-page order for non-Latin
+        # blocks without mutating the cached OCR dictionaries.
+        ordered_body_ar = []
+        for block in body_ar:
+            item = dict(block)
+            if (item["x0"] + item["x1"]) / 2 >= spread_gutter:
+                item["y0"] += ph + 1
+                item["y1"] += ph + 1
+            ordered_body_ar.append(item)
+        body_ar = ordered_body_ar
 
     elements: list[dict] = []
     if centered_imprint or centered_title_credits:
@@ -1524,9 +1865,39 @@ def structure_page_vision(
     elements.sort(key=lambda e: e["y"])
 
     # Footnotes (each can contain inline Arabic via leading_arabic + embedded_arabic)
-    notes = parse_footnotes_from_vision(
-        fn_lines, all_pdf_spans, body_size, fn_ar, vision_page["pno"], fn_y_threshold=fn_y0
-    )
+    notes: list[dict] = []
+    note_groups = fn_line_groups if spread else [fn_lines]
+    for column_index, group in enumerate(note_groups):
+        if not group:
+            continue
+        if spread_gutter is None:
+            column_spans = all_pdf_spans
+            column_ar = fn_ar
+        elif column_index == 0:
+            column_spans = [span for span in all_pdf_spans if span["x1"] <= spread_gutter]
+            column_ar = [
+                block for block in fn_ar
+                if (block["x0"] + block["x1"]) / 2 < spread_gutter
+            ]
+        else:
+            column_spans = [span for span in all_pdf_spans if span["x0"] >= spread_gutter]
+            column_ar = [
+                block for block in fn_ar
+                if (block["x0"] + block["x1"]) / 2 >= spread_gutter
+            ]
+        column_notes = parse_footnotes_from_vision(
+            group,
+            column_spans,
+            body_size,
+            column_ar,
+            vision_page["pno"],
+            fn_y_threshold=fn_y0,
+        )
+        if spread:
+            offset = column_index * (ph + 1)
+            for note in column_notes:
+                note["y"] += offset
+        notes.extend(column_notes)
     for n in notes:
         ftext = n["text"]
         for blk in n["embedded_arabic"]:

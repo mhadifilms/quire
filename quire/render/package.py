@@ -264,6 +264,15 @@ def render_nav(cfg: BookConfig, chapters, page_list) -> str:
         f'      <li><a href="{href}">{html.escape(label)}</a></li>'
         for (_pno, href, label) in page_list
     ]
+    page_list_nav = ""
+    if page_items:
+        page_list_nav = f"""
+    <nav epub:type="page-list" role="doc-pagelist" id="page-list">
+      <h2>Page List</h2>
+      <ol>
+{chr(10).join(page_items)}
+      </ol>
+    </nav>"""
     body_href = f"text/{first_chapter_slug}.xhtml" if first_chapter_slug else "text/cover.xhtml"
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
@@ -289,12 +298,7 @@ def render_nav(cfg: BookConfig, chapters, page_list) -> str:
         <li><a epub:type="bodymatter" href="{body_href}">Begin Reading</a></li>
       </ol>
     </nav>
-    <nav epub:type="page-list" role="doc-pagelist" id="page-list">
-      <h2>Page List</h2>
-      <ol>
-{chr(10).join(page_items)}
-      </ol>
-    </nav>
+{page_list_nav}
   </body>
 </html>
 """

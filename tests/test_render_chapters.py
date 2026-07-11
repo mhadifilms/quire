@@ -9,6 +9,7 @@ from quire.render.chapters import (
     render_chapter,
     slugify,
 )
+from quire.render.package import render_nav
 from quire.structure.pdf_based import configure_known_headings
 
 
@@ -53,6 +54,7 @@ def test_assemble_chapters_splits_on_known_heading() -> None:
         ]
         chapters = assemble_chapters(pages_meta, ocr_pages)
         titles = [c.title for c in chapters]
+        assert "Front Matter" not in titles
         assert "Chapter One" in titles
         assert "Chapter Two" in titles
     finally:
@@ -62,6 +64,7 @@ def test_assemble_chapters_splits_on_known_heading() -> None:
 def test_assemble_chapters_skips_configured_cover_page() -> None:
     class Cfg:
         cover_pdf_page = 1
+        raw = {}
 
     pages_meta = [{"printed_page": 1}, {"printed_page": 2}]
     ocr_pages = [
@@ -79,6 +82,23 @@ def test_assemble_chapters_skips_configured_cover_page() -> None:
     assert front_text == ["Real front matter"]
 
 
+def test_assemble_chapters_keeps_cover_page_when_it_is_story_content() -> None:
+    class Cfg:
+        cover_pdf_page = 1
+        raw = {"input": {"cover_is_content": True}}
+
+    chapters = assemble_chapters(
+        [{"printed_page": None}],
+        [{
+            "pno": 1,
+            "elements": [{"kind": "paragraph", "text": "Story starts here.", "y": 50}],
+        }],
+        cfg=Cfg(),
+    )
+
+    assert [element["text"] for element in chapters[0].elements] == ["Story starts here."]
+
+
 def test_render_chapter_emits_xhtml_skeleton() -> None:
     chapter = Chapter(title="Hello", slug="ch-01", page_start=1)
     chapter.elements = [
@@ -93,6 +113,17 @@ def test_render_chapter_emits_xhtml_skeleton() -> None:
     assert "<h1" in xhtml
     assert 'lang="en"' in xhtml
     assert 1 in emitted
+
+
+def test_navigation_omits_empty_page_list() -> None:
+    class Cfg:
+        language = "en"
+
+    chapter = Chapter(title="Story", slug="story", page_start=1)
+    nav = render_nav(Cfg(), [chapter], [])
+
+    assert 'epub:type="toc"' in nav
+    assert 'epub:type="page-list"' not in nav
 
 
 def test_render_chapter_with_footnote_creates_aside() -> None:

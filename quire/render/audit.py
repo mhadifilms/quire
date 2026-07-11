@@ -131,7 +131,7 @@ def _collect_ids_and_links(html_bytes: bytes):
 
 
 SUSPICIOUS_TEXT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("question/exclamation-shaped footnote marker", re.compile(r"\b[A-Za-z][A-Za-z\-]*(?:\))?(?:\.{1,3}|[,;:!])[?!](?:\s|$)|\b[A-Za-z][A-Za-z\-]*\?(?=\s+[a-z])")),
+    ("question/exclamation-shaped footnote marker", re.compile(r"\b[A-Za-z][A-Za-z\-]*(?:\))?(?:\.{1,3}|[,;:!])[?!](?:\s|$)")),
     ("common OCR typo: che/bur/chis/dury", re.compile(r"\b(?:che|bur|chis|dury)\b", re.I)),
     ("cursive transliteration OCR variant", re.compile(r"\b(?:migat|migar|migas|mubrim|ibram|tagsir)\b", re.I)),
     ("short inline-Arabic mojibake token", re.compile(r"\b(?:ug|jes|f'es|jo|jé)\b")),

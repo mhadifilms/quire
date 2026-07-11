@@ -27,7 +27,7 @@ _INLINE_CUE_RE = re.compile(
 _SAFE_SHORT = {
     "the", "a", "an", "of", "is", "in", "at", "on", "by", "for", "to", "or",
     "and", "but", "yet", "so", "if", "as", "be", "do", "go", "he", "it",
-    "we", "us", "no", "not", "all", "any", "one", "two", "three",
+    "we", "us", "me", "him", "no", "not", "all", "any", "one", "two", "three",
     "you", "his", "her", "its", "our", "are", "was", "had", "has", "may",
     "can", "old", "new", "see", "say", "this",
     "very", "such", "from", "with", "into", "they", "them", "what", "when",
@@ -224,8 +224,6 @@ _COMMON_OCR_WORD_FIXES = {
     "ser": "set",
     "Ser": "Set",
     "Sociery": "Society",
-    "stares": "states",
-    "Stares": "States",
     "supplicares": "supplicates",
     "Supplicares": "Supplicates",
     "tempcations": "temptations",

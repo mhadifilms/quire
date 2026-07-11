@@ -842,6 +842,37 @@ def _ocr_pages_for(
         pages = _run_tesseract_ocr(cfg, force=force, retry_failed=retry_failed)
     else:
         pages = _run_vision_ocr(cfg, force=force, retry_failed=retry_failed)
+    fallback_engine = str(
+        cfg.raw.get("ocr", {}).get("fallback_engine", "")
+    ).strip().lower()
+    if fallback_engine and fallback_engine != engine_name:
+        if fallback_engine not in {"vision", "tesseract"}:
+            raise ValueError(
+                "ocr.fallback_engine must be 'vision' or 'tesseract', "
+                f"got {fallback_engine!r}"
+            )
+        log(f"running {fallback_engine} as OCR quality fallback")
+        if fallback_engine == "tesseract":
+            fallback_pages = _run_tesseract_ocr(
+                cfg,
+                force=force,
+                retry_failed=retry_failed,
+            )
+        else:
+            fallback_pages = _run_vision_ocr(
+                cfg,
+                force=force,
+                retry_failed=retry_failed,
+            )
+        fallback_by_pno = {
+            page.get("pno"): page for page in fallback_pages
+        }
+        for page in pages:
+            fallback_page = fallback_by_pno.get(page.get("pno"))
+            if fallback_page is not None:
+                page["fallback_en_lines"] = list(
+                    fallback_page.get("en_lines", [])
+                )
     refined = _run_arabic_refine(cfg, pages, force=force)
 
     # Normalize confidences and re-cluster Arabic blocks. Tesseract's

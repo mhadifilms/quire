@@ -48,6 +48,8 @@ def test_recovers_misread_footnote_markers(text: str, expected: int) -> None:
         "Hello, world! How are you?",
         "He said: 'hello'",
         '"jamrah?"',
+        "4EVA!",
+        "1944 was a difficult year.",
     ],
 )
 def test_preserves_genuine_punctuation(text: str) -> None:

@@ -107,7 +107,13 @@ def assemble_chapters(
         meta = pages_meta[i] if i < len(pages_meta) else {}
         pdf_pno = op.get("pno", i + 1)
         printed = meta.get("printed_page")
-        if cfg is not None and pdf_pno == getattr(cfg, "cover_pdf_page", None):
+        input_cfg = getattr(cfg, "raw", {}).get("input", {}) if cfg is not None else {}
+        cover_is_content = bool(input_cfg.get("cover_is_content", False))
+        if (
+            cfg is not None
+            and pdf_pno == getattr(cfg, "cover_pdf_page", None)
+            and not cover_is_content
+        ):
             continue
         current.add_pagebreak(pdf_pno, printed)
 
@@ -138,6 +144,11 @@ def assemble_chapters(
         for fn in [e for e in elements if e["kind"] == "footnote"]:
             current.footnotes.append({**fn, "_pdf_pno": pdf_pno, "_printed": printed})
 
+    # Do not package the synthetic front-matter chapter when the source opens
+    # directly on a configured chapter heading. An empty chapter creates an
+    # empty nested ``<ol>`` in EPUB navigation, which EPUBCheck rejects.
+    if len(chapters) > 1 and not chapters[0].elements and not chapters[0].footnotes:
+        chapters = chapters[1:]
     return chapters
 
 
