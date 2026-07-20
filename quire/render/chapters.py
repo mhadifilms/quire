@@ -109,6 +109,7 @@ def assemble_chapters(
         printed = meta.get("printed_page")
         input_cfg = getattr(cfg, "raw", {}).get("input", {}) if cfg is not None else {}
         cover_is_content = bool(input_cfg.get("cover_is_content", False))
+        auto_detected = bool(input_cfg.get("auto_detected", False))
         if (
             cfg is not None
             and pdf_pno == getattr(cfg, "cover_pdf_page", None)
@@ -130,7 +131,11 @@ def assemble_chapters(
                     chapters.append(current)
                     current.add_pagebreak(pdf_pno, printed)
                     continue
-                if not level1 and elem.get("level", 3) <= 2 and current.elements:
+                if (
+                    (not level1 or auto_detected)
+                    and elem.get("level", 3) <= 2
+                    and current.elements
+                ):
                     title = elem["text"]
                     slug = _disambiguate_slug(
                         seen_slugs, f"ch-{len(chapters):02d}-{slugify(title)}"
@@ -147,8 +152,24 @@ def assemble_chapters(
     # Do not package the synthetic front-matter chapter when the source opens
     # directly on a configured chapter heading. An empty chapter creates an
     # empty nested ``<ol>`` in EPUB navigation, which EPUBCheck rejects.
-    if len(chapters) > 1 and not chapters[0].elements and not chapters[0].footnotes:
-        chapters = chapters[1:]
+    if len(chapters) > 1:
+        front_words = sum(
+            len(re.findall(r"[A-Za-z]+", str(element.get("text", ""))))
+            for element in chapters[0].elements
+        )
+        auto_detected = bool(
+            getattr(cfg, "raw", {}).get("input", {}).get("auto_detected", False)
+            if cfg is not None
+            else False
+        )
+        empty_front = not chapters[0].elements and not chapters[0].footnotes
+        short_auto_noise = (
+            auto_detected
+            and front_words <= 20
+            and not chapters[0].footnotes
+        )
+        if empty_front or short_auto_noise:
+            chapters = chapters[1:]
     return chapters
 
 
@@ -497,12 +518,20 @@ def render_chapter(
     first_ref_ids: dict[tuple[int, str], str] = {}
 
     emitted_printed_pages: set[int] = set()
+    inline_page_numbers = {
+        int(pagebreak.get("pdf_pno"))
+        for element in chapter.elements
+        for pagebreak in element.get("_continuation_pagebreaks", [])
+        if str(pagebreak.get("pdf_pno", "")).isdigit()
+    }
     last_pno: int | None = None
     for elem in chapter.elements:
         pdf_pno = elem["_pdf_pno"]
         printed = elem["_printed"]
         if pdf_pno != last_pno:
-            if printed is not None:
+            if pdf_pno in inline_page_numbers:
+                pass
+            elif printed is not None:
                 out.append(
                     f'      <span epub:type="pagebreak" role="doc-pagebreak" '
                     f'id="page-{printed}" aria-label="{printed}" title="page {printed}"></span>\n'
@@ -547,10 +576,45 @@ def render_chapter(
                     pdf_pno_for_ref = pdf_pno
             else:
                 pdf_pno_for_ref = pdf_pno
+            raw_text = elem["text"]
+            inline_breaks: list[tuple[str, str, int | None]] = []
+            for index, pagebreak in enumerate(
+                sorted(
+                    elem.get("_continuation_pagebreaks", []),
+                    key=lambda item: int(item.get("offset", 0)),
+                    reverse=True,
+                )
+            ):
+                offset = max(0, min(len(raw_text), int(pagebreak.get("offset", 0))))
+                token = f"QUIREPAGEBREAKTOKEN{index}"
+                printed_value = pagebreak.get("printed")
+                printed_page = (
+                    int(printed_value)
+                    if str(printed_value).isdigit()
+                    else None
+                )
+                page_number = int(pagebreak.get("pdf_pno", pdf_pno))
+                raw_text = raw_text[:offset] + token + raw_text[offset:]
+                if printed_page is not None:
+                    span = (
+                        f'<span epub:type="pagebreak" role="doc-pagebreak" '
+                        f'id="page-{printed_page}" aria-label="{printed_page}" '
+                        f'title="page {printed_page}"></span>'
+                    )
+                    emitted_printed_pages.add(printed_page)
+                else:
+                    span = (
+                        f'<span epub:type="pagebreak" role="doc-pagebreak" '
+                        f'id="page-pdf-{page_number}" aria-label="pdf-{page_number}" '
+                        f'title="pdf page {page_number}"></span>'
+                    )
+                inline_breaks.append((token, span, printed_page))
             text = render_inline(
-                elem["text"], pdf_pno_for_ref, available, fn_occurrences, emitted_refs,
+                raw_text, pdf_pno_for_ref, available, fn_occurrences, emitted_refs,
                 valid_noterefs, note_ids, first_ref_ids
             )
+            for token, span, _printed_page in inline_breaks:
+                text = text.replace(token, span)
             out.append(f'      <p class="{" ".join(classes)}">{text}</p>\n')
         elif elem["kind"] == "arabic":
             # If the block was already replaced by canonical Quran text, the

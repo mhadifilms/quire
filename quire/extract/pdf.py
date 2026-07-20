@@ -139,7 +139,11 @@ HEADER_RE = re.compile(
 )
 
 
-def parse_running_header(line: dict, page_no: int) -> tuple[str | None, int | None]:
+def parse_running_header(
+    line: dict,
+    page_no: int,
+    page_width: float | None = None,
+) -> tuple[str | None, int | None]:
     """If the line looks like a running header, return (title, printed_page)."""
     text = "".join(s["text"] for s in line["spans"]).strip()
     if not text:
@@ -148,6 +152,22 @@ def parse_running_header(line: dict, page_no: int) -> tuple[str | None, int | No
         return None, None
     m = HEADER_RE.match(text)
     if not m:
+        # Fiction commonly alternates a title and author in title case.
+        # Since callers only inspect the first few top-margin lines, short
+        # centred or edge-aligned title-case strings are safe to discard.
+        words = re.findall(r"[A-Za-z]+", text)
+        title_case_ratio = (
+            sum(word[:1].isupper() for word in words) / len(words)
+            if words else 0.0
+        )
+        width = line["bbox"][2] - line["bbox"][0]
+        if (
+            1 <= len(words) <= 8
+            and len(text) <= 60
+            and title_case_ratio >= 0.60
+            and (page_width is None or width < page_width * 0.40)
+        ):
+            return text, None
         return None, None
     num = m.group("num") or m.group("num2")
     try:
@@ -327,17 +347,38 @@ def extract_page(doc: fitz.Document, pno: int) -> dict:
     for idx in range(min(4, len(raw_lines))):
         if raw_lines[idx]["bbox"][1] >= 65:
             break
-        h_title, h_num = parse_running_header(raw_lines[idx], pno)
+        h_title, h_num = parse_running_header(raw_lines[idx], pno, pw)
         if h_title:
             header_title = h_title
             printed_page = h_num
             body_start_idx = idx + 1
             break
 
+    # Many literary editions put the folio alone in the bottom margin rather
+    # than beside the running header. Capture it before footer filtering so the
+    # EPUB can build a real print-page list.
+    footer_page_idx: int | None = None
+    for idx in range(len(raw_lines) - 1, body_start_idx - 1, -1):
+        line = raw_lines[idx]
+        if line["bbox"][1] < ph * 0.82:
+            break
+        text = "".join(span.get("text", "") for span in line.get("spans", []))
+        compact = re.sub(r"\s+", "", text)
+        if re.fullmatch(r"\d{1,4}", compact):
+            printed_page = compact
+            footer_page_idx = idx
+            break
+
+    content_lines = [
+        line
+        for idx, line in enumerate(raw_lines)
+        if idx >= body_start_idx and idx != footer_page_idx
+    ]
+
     # Estimate body left/right margins from text-rich lines only (so single
     # short centered lines don't pull the margin in).
     candidate_lines = [
-        L for L in raw_lines[body_start_idx:] if (L["bbox"][2] - L["bbox"][0]) > pw * 0.4
+        L for L in content_lines if (L["bbox"][2] - L["bbox"][0]) > pw * 0.4
     ]
     if candidate_lines:
         body_left = min(L["bbox"][0] for L in candidate_lines)
@@ -349,7 +390,7 @@ def extract_page(doc: fitz.Document, pno: int) -> dict:
     # using the *full* line stream (including lines that will later be dropped
     # because they fall inside an OCR-Arabic zone) so the boundary still works
     # when OCR happens to catch the first small-font footnote line.
-    cooked = [line_dict(L, pw, body_left, body_right) for L in raw_lines[body_start_idx:]]
+    cooked = [line_dict(L, pw, body_left, body_right) for L in content_lines]
     cooked_nonempty = [L for L in cooked if L["text"] or L["all_spans"]]
     fn_idx = find_footnote_boundary(cooked_nonempty, body_size, ph)
     if fn_idx is None:

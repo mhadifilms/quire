@@ -141,7 +141,28 @@ SUSPICIOUS_TEXT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # punctuation — is legitimate dialogue/quotation and not a misread,
     # so we explicitly exclude those by requiring NO sentence-end char
     # immediately before the quote.
-    ("quote-shaped footnote marker", re.compile(r"\b[A-Za-z][A-Za-z\-]*[,;:]?['’]\s+[A-Z]")),
+    (
+        "quote-shaped footnote marker",
+        re.compile(r"\b(?![A-Z]{2,}['’])[A-Za-z][A-Za-z\-]*['’]\s+[A-Z]"),
+    ),
+    (
+        "malformed OCR contraction",
+        re.compile(
+            r"\b(?:T['’]?(?:d|ve|ll)|Tt['’]s|"
+            r"(?:should|could|would|must|might)\s+ve)\b",
+            re.I,
+        ),
+    ),
+    ("OCR underscore used as punctuation", re.compile(r"\b[A-Za-z'’]+\s+_\s+[A-Z]")),
+    (
+        "split or doubled sentence punctuation",
+        re.compile(r"(?<!\.)\.[?!]"),
+    ),
+    ("unexpected English OCR diacritic", re.compile(r"\b[A-Za-z]*[äöüÄÖÜ][A-Za-z]*\b")),
+    (
+        "contextual conjunction OCR error",
+        re.compile(r"\b(?:wars?|conflicts?)\s+arid\s+(?:famines?|hunger)\b", re.I),
+    ),
 ]
 
 
@@ -405,6 +426,40 @@ def run_audit(
                     })
 
     suspicious = link_findings + _suspicious_text_artifacts(files)
+    quality_warnings: list[dict[str, str]] = []
+    if cfg.ocr_engine.lower() in {"vision", "tesseract"} and pdf_real < eng_words * 0.5:
+        quality_warnings.append({
+            "kind": "style fidelity unavailable",
+            "file": "",
+            "excerpt": (
+                "The source is image-only or has a sparse text layer; "
+                "italic/bold fidelity cannot be verified from PDF font spans."
+            ),
+        })
+    if ocr_pages:
+        final_lines = list(ocr_pages[-1].get("fallback_en_lines", []))
+        if not final_lines:
+            final_lines = list(ocr_pages[-1].get("en_lines", []))
+        if final_lines:
+            width = float(ocr_pages[-1].get("page_size_pt", (0, 0))[0] or 0)
+            if width:
+                right_lines = [
+                    line for line in final_lines
+                    if (line.get("x0", 0) + line.get("x1", 0)) / 2 >= width / 2
+                ]
+                if right_lines:
+                    final_lines = right_lines
+            last_line = max(final_lines, key=lambda line: line.get("y1", line.get("y0", 0)))
+            last_text = last_line.get("text", "").strip()
+            if (
+                len(re.findall(r"[A-Za-z]+", last_text)) >= 4
+                and not re.search(r'[.!?]["”’\')\]]?\s*$', last_text)
+            ):
+                quality_warnings.append({
+                    "kind": "source excerpt ends mid-sentence",
+                    "file": "",
+                    "excerpt": last_text[:180],
+                })
 
     report_lines = [
         f"chapter files: {len(chapter_files)}",
@@ -417,6 +472,7 @@ def run_audit(
         f"Arabic  coverage: {ar_pct:.1f}%   (target >= 95%)",
         f"unresolved internal links: {issues}",
         f"suspicious OCR/noteref artifacts: {len(suspicious)}",
+        f"quality warnings: {len(quality_warnings)}",
         "",
         "per-chapter sanity:",
     ]
@@ -463,6 +519,7 @@ def run_audit(
         "arabic_coverage_pct": ar_pct,
         "unresolved_links": issues,
         "suspicious_count": len(suspicious),
+        "warning_count": len(quality_warnings),
         "per_chapter": [
             {
                 "file": Path(name).name,
@@ -475,6 +532,7 @@ def run_audit(
             {"kind": item["kind"], "file": item.get("file", ""), "excerpt": item["excerpt"]}
             for item in suspicious
         ],
+        "warnings": quality_warnings,
     }
     if epubcheck_result is not None:
         audit_json["epubcheck_status"] = epubcheck_result["status"]
@@ -555,6 +613,7 @@ def run_audit(
         "arabic_pct": ar_pct,
         "unresolved_links": issues,
         "suspicious_count": len(suspicious),
+        "warning_count": len(quality_warnings),
         "opf_issues": opf_issues,
         "audit_path": str(cfg.audit_path),
         "audit_json_path": str(cfg.audit_json_path),

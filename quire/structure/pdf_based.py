@@ -303,6 +303,22 @@ def merge_paragraphs(
             return False
         if L["median_size"] >= body_size * 1.25:
             return True
+        # Literary section labels are often short italic names set only
+        # slightly larger than body text and left-aligned. Keep them as
+        # block-level headings instead of merging them into the first sentence
+        # (which produces stutters such as ``Stewart Stewart Doig...``).
+        nonblank_spans = [
+            span for span in L.get("spans", []) if span.get("text", "").strip()
+        ]
+        if (
+            1 <= len(L["text"].split()) <= 4
+            and len(L["text"]) <= 40
+            and L["median_size"] >= body_size * 1.08
+            and nonblank_spans
+            and all(span.get("italic") and not span.get("bold") for span in nonblank_spans)
+            and not re.search(r"[.!?]\s*$", L["text"])
+        ):
+            return True
         if L["is_centered"] and L["median_size"] >= body_size * 1.08 and len(L["text"]) <= 60:
             words = L["text"].split()
             spans_bold = any(s.get("bold") for s in L.get("spans", []))
@@ -362,8 +378,18 @@ def rejoin_text(text_lines: list[str]) -> str:
         if out.endswith(SOFT_HYPHEN):
             out = out[:-1] + line.lstrip()
         elif out.endswith("-") and i > 0 and line[:1].islower():
-            # Soft-hyphenation rendered as ASCII '-': drop hyphen and join.
-            out = out[:-1] + line.lstrip()
+            # Preserve semantic compounds split at line end while removing
+            # ordinary discretionary hyphenation.
+            prefix_match = re.search(r"([A-Za-z]+(?:-[A-Za-z]+)*)-$", out)
+            prefix = prefix_match.group(1) if prefix_match else ""
+            number_words = {
+                "twenty", "thirty", "forty", "fifty", "sixty",
+                "seventy", "eighty", "ninety",
+            }
+            if "-" in prefix or prefix.lower() in number_words:
+                out = out + line.lstrip()
+            else:
+                out = out[:-1] + line.lstrip()
         else:
             out = out.rstrip() + " " + line.lstrip()
     return re.sub(r"\s+", " ", out).strip()
@@ -456,15 +482,49 @@ def parse_footnotes(footnote_lines: list[dict], body_size: float) -> list[dict]:
 # ---------- main per-page structuring ----------
 
 
+def _merge_drop_caps(lines: list[dict], body_size: float) -> list[dict]:
+    """Attach a standalone oversized initial to its first body line."""
+    items = [dict(line) for line in lines]
+    drop_indexes: set[int] = set()
+    for index, line in enumerate(items):
+        initial = line.get("text", "").strip()
+        if (
+            not re.fullmatch(r"[A-Z]", initial)
+            or line.get("median_size", 0) < body_size * 2
+        ):
+            continue
+        for next_index in range(index + 1, min(index + 4, len(items))):
+            candidate = items[next_index]
+            if candidate.get("x0", 0) <= line.get("x0", 0):
+                continue
+            if candidate.get("y", 0) > line.get("y_bottom", 0) + 3:
+                break
+            candidate["text"] = initial + candidate.get("text", "").lstrip()
+            span = dict(line["spans"][0]) if line.get("spans") else {
+                "text": initial,
+                "size": body_size,
+                "bold": False,
+                "italic": False,
+            }
+            span["size"] = body_size
+            span["bold"] = False
+            span["italic"] = False
+            candidate["spans"] = [span] + list(candidate.get("spans", []))
+            drop_indexes.add(index)
+            break
+    return [line for index, line in enumerate(items) if index not in drop_indexes]
+
+
 def structure_page(
     page_extract: dict,
     arabic_blocks: list[dict],
     body_size_global: float,
 ) -> list[dict]:
-    body_lines = filter_mojibake(page_extract["body_lines"], arabic_blocks)
-    footnote_lines = filter_mojibake(page_extract["footnote_lines"], arabic_blocks)
     body_size_local = page_extract["body_size"]
     body_size = body_size_global if body_size_global > 0 else body_size_local
+    body_lines = _merge_drop_caps(page_extract["body_lines"], body_size)
+    body_lines = filter_mojibake(body_lines, arabic_blocks)
+    footnote_lines = filter_mojibake(page_extract["footnote_lines"], arabic_blocks)
     page_width = page_extract["page_size"][0]
 
     # Filter Arabic blocks: drop noise (very short blocks, header strays,

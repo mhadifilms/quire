@@ -292,13 +292,33 @@ def strip_footnote_misread_quotes(html: str) -> tuple[str, int]:
         def safe_r2(m: re.Match) -> str:
             nonlocal n_local
             start = m.start()
-            preceding = text[max(0, start - 60):start]
+            # The opening quote can be hundreds of characters earlier in a
+            # long fiction paragraph. A fixed 60-character window caused real
+            # dialogue closers (``disappear." His laugh``) to be stripped.
+            preceding = text[:start]
             if preceding.count('"') % 2 == 1:
                 return m.group(0)
             n_local += 1
             return m.group(1) + ". "
 
         text = re.sub(r'([a-z]+)\." (?=[A-Z][a-z])', safe_r2, text)
+
+        def restore_missing_stop(m: re.Match) -> str:
+            nonlocal n_local
+            start = m.start()
+            preceding = text[max(0, start - 240):start]
+            # Only repair inside an open dialogue span. This avoids changing
+            # ordinary plural possessives such as ``students' society``.
+            if not re.search(r"(?:^|[\s(])['\"“‘][A-Z]", preceding):
+                return m.group(0)
+            n_local += 1
+            return f"{m.group(1)}.{m.group(2)} "
+
+        text = re.sub(
+            r"\b([a-z][A-Za-z-]*)(['’])\s+(?=[A-Z])",
+            restore_missing_stop,
+            text,
+        )
         return text, n_local
 
     return _operate_on_text_only(html, fix)

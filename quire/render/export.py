@@ -7,6 +7,7 @@ post-processing in one shared pipeline instead of format-specific branches.
 
 from __future__ import annotations
 
+import copy
 import html
 import re
 from pathlib import Path
@@ -22,6 +23,13 @@ from .chapters import (
     slugify,
 )
 from .package import CSS_BODY
+from .typography import (
+    build_vocab,
+    collapse_repetition_runs,
+    load_qc_fixes,
+    stitch_hyphens,
+    strip_footnote_misread_quotes,
+)
 
 
 def _strip_control_markers(text: str) -> str:
@@ -122,12 +130,22 @@ def _note_ids(chapter: Chapter) -> dict[tuple[int, str], str]:
 
 def render_markdown(cfg: BookConfig, chapters: list[Chapter]) -> str:
     lines = [f"# {cfg.title}", "", f"*{cfg.author}*", ""]
+    visible_chapters = [
+        chapter for chapter in chapters if chapter.elements or chapter.footnotes
+    ]
     for chapter in chapters:
         if not chapter.elements and not chapter.footnotes:
             continue
         fn_by_page = _footnotes_by_page(chapter)
         note_ids = _note_ids(chapter)
-        lines.extend([f"## {chapter.title}", ""])
+        # A single-story export already has the story title as its document H1.
+        # Repeating the identical title as an H2 is redundant; multi-chapter
+        # books retain every chapter heading.
+        same_as_book = re.sub(r"\W+", "", chapter.title).casefold() == re.sub(
+            r"\W+", "", cfg.title
+        ).casefold()
+        if len(visible_chapters) > 1 or not same_as_book:
+            lines.extend([f"## {chapter.title}", ""])
         for elem in chapter.elements:
             pdf_pno = int(elem["_pdf_pno"])
             available = fn_by_page.get(pdf_pno, set())
@@ -248,7 +266,49 @@ def render_html(cfg: BookConfig, chapters: list[Chapter]) -> str:
 """
 
 
+def _apply_export_qc(
+    chapters: list[Chapter],
+    fixes: dict[str, str],
+) -> list[Chapter]:
+    """Apply generic typography and QC fixes to non-EPUB export models."""
+    corrected = copy.deepcopy(chapters)
+    corpus = "\n".join(
+        str(item.get("text", ""))
+        for chapter in corrected
+        for item in [*chapter.elements, *chapter.footnotes]
+    )
+    vocab = build_vocab(corpus)
+    for chapter in corrected:
+        for item in [*chapter.elements, *chapter.footnotes]:
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+            text, _ = stitch_hyphens(text, vocab)
+            text, _ = strip_footnote_misread_quotes(text)
+            text, _ = collapse_repetition_runs(text)
+            for find, replace in fixes.items():
+                if find != replace:
+                    text = text.replace(find, replace)
+            item["text"] = text
+        chapter.elements = [
+            item for item in chapter.elements
+            if item.get("kind") == "arabic" or item.get("text", "").strip()
+        ]
+        chapter.footnotes = [
+            item for item in chapter.footnotes
+            if item.get("text", "").strip()
+        ]
+    return [
+        chapter for chapter in corrected
+        if chapter.elements or chapter.footnotes
+    ]
+
+
 def write_exports(cfg: BookConfig, chapters: list[Chapter], formats: set[str]) -> dict[str, Path]:
+    chapters = _apply_export_qc(
+        chapters,
+        load_qc_fixes(cfg.qc_fixes_path),
+    )
     written: dict[str, Path] = {}
     if "markdown" in formats:
         atomic_write_text(cfg.markdown_path, render_markdown(cfg, chapters))

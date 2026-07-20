@@ -321,3 +321,82 @@ def test_common_ocr_does_not_rewrite_pronoun_phrases_or_possessives() -> None:
     common_ocr.post_structure(_Cfg({"common_ocr": {}}), pages)
     assert pages[0]["elements"][5]["text"] == "Your Lord remains distinct."
     assert pages[0]["elements"][11]["text"] == "Imam Sadiq's words remain possessive."
+
+
+def test_common_ocr_repairs_rare_speaker_name_from_dominant_book_usage() -> None:
+    elements = [
+        {
+            "kind": "paragraph",
+            "text": f'"Line {index}," Grandma said.',
+            "conf": 96,
+            "y": index,
+        }
+        for index in range(5)
+    ]
+    elements.append(
+        {
+            "kind": "paragraph",
+            "text": '"I know," Grandina said.',
+            "conf": 100,
+            "y": 6,
+        }
+    )
+    pages = [{"elements": elements}]
+
+    common_ocr.post_structure(_Cfg({"common_ocr": {}}), pages)
+
+    assert pages[0]["elements"][-1]["text"] == '“I know,” Grandma said.'
+
+
+def test_common_ocr_repairs_contextual_english_damage() -> None:
+    pages = [
+        {
+            "elements": [
+                {
+                    "kind": "paragraph",
+                    "text": (
+                        "Boy, you should ve seen it at the same. "
+                        "They lost friends to wars arid famines, and they. all left. "
+                        "'I've learnt a lot from you.?"
+                    ),
+                    "conf": 100,
+                    "y": 1,
+                }
+            ]
+        }
+    ]
+
+    common_ocr.post_structure(_Cfg({"common_ocr": {}}), pages)
+
+    assert pages[0]["elements"][0]["text"] == (
+        "Boy, you should've seen it at the same time. "
+        "They lost friends to wars and famines, and they all left. "
+        "'I've learnt a lot from you.'"
+    )
+
+
+def test_common_ocr_repairs_conservative_dialogue_boundaries() -> None:
+    pages = [
+        {
+            "elements": [
+                {
+                    "kind": "paragraph",
+                    "text": (
+                        "'We've run out of chapattis. With a soup ladle, he served. "
+                        "'I work in a kebab shop, Kassim said. "
+                        "I've found a wing,' he looked up."
+                    ),
+                    "conf": 100,
+                    "y": 1,
+                }
+            ]
+        }
+    ]
+
+    common_ocr.post_structure(_Cfg({"common_ocr": {}}), pages)
+
+    assert pages[0]["elements"][0]["text"] == (
+        "'We've run out of chapattis.' With a soup ladle, he served. "
+        "'I work in a kebab shop,' Kassim said. "
+        "'I've found a wing,' he looked up."
+    )

@@ -1102,13 +1102,27 @@ def _merge_cross_page_paragraphs(ocr_pages: list[dict]) -> None:
         #     mid-sentence continuation)
         if _SENTENCE_END_RE.search(a_text):
             continue
-        if not _PARAGRAPH_OPEN_RE.match(b_text):
+        conjunction_continuation = bool(
+            re.search(r"\b(?:and|or|but|because|while|when|that)\s*$", a_text, re.I)
+        )
+        if not _PARAGRAPH_OPEN_RE.match(b_text) and not conjunction_continuation:
             continue
         b_text = _encode_cross_page_noterefs(
             b_text,
             int(ocr_pages[i + 1].get("pno", i + 2)),
             _footnote_numbers(elems_b),
         )
+        break_offset = len(a_text) + 1
+        continuation_breaks = last.setdefault("_continuation_pagebreaks", [])
+        continuation_breaks.append({
+            "offset": break_offset,
+            "pdf_pno": int(ocr_pages[i + 1].get("pno", i + 2)),
+            "printed": ocr_pages[i + 1].get("printed_page"),
+        })
+        for inherited in first.get("_continuation_pagebreaks", []):
+            shifted = dict(inherited)
+            shifted["offset"] = break_offset + int(inherited.get("offset", 0))
+            continuation_breaks.append(shifted)
         last["text"] = a_text + " " + b_text
         a_conf = last.get("conf", -1)
         b_conf = first.get("conf", -1)
@@ -1119,6 +1133,84 @@ def _merge_cross_page_paragraphs(ocr_pages: list[dict]) -> None:
         merged += 1
     if merged:
         log(f"  merged {merged} cross-page paragraphs")
+
+
+def _merge_open_dialogue_paragraphs(ocr_pages: list[dict]) -> None:
+    """Undo false paragraph splits inside an unclosed dialogue span."""
+
+    def has_open_dialogue(text: str) -> bool:
+        double_count = sum(text.count(char) for char in '"“”')
+        single_count = len(
+            re.findall(r"(?<![A-Za-z])['‘’]|['‘’](?![A-Za-z])", text)
+        )
+        return double_count % 2 == 1 or single_count % 2 == 1
+
+    for page in ocr_pages:
+        elements = page.get("elements", [])
+        index = 0
+        while index + 1 < len(elements):
+            previous = elements[index]
+            following = elements[index + 1]
+            following_text = following.get("text", "").lstrip()
+            dialogue_continuation = bool(
+                re.match(
+                    r"(?:[a-z]|(?:Don|Can|Won|Wouldn|Shouldn|Couldn)['’]t\b|"
+                    r"It['’]s\b)",
+                    following_text,
+                )
+            )
+            if (
+                previous.get("kind") == "paragraph"
+                and following.get("kind") == "paragraph"
+                and has_open_dialogue(previous.get("text", ""))
+                and not re.match(r"\s*['\"“‘]", following_text)
+                and dialogue_continuation
+            ):
+                previous["text"] = (
+                    previous.get("text", "").rstrip()
+                    + " "
+                    + following.get("text", "").lstrip()
+                )
+                elements.pop(index + 1)
+                continue
+            index += 1
+
+
+def _split_embedded_scene_breaks(ocr_pages: list[dict]) -> None:
+    """Turn OCR'd inline ``***`` separators back into block elements."""
+    for page in ocr_pages:
+        rebuilt: list[dict] = []
+        for element in page.get("elements", []):
+            text = element.get("text", "")
+            if element.get("kind") != "paragraph":
+                rebuilt.append(element)
+                continue
+            narrative_parts = re.split(
+                r'(?<=[.!?]["”\'])\s+(?=Now,\s+I\b)|'
+                r'(?<=["”])\s+(?=["“])',
+                text,
+            )
+            for narrative_index, narrative in enumerate(narrative_parts):
+                pieces = re.split(r"\s*\*{3}\s*", narrative)
+                for index, piece in enumerate(pieces):
+                    if piece.strip():
+                        part = dict(element)
+                        part["text"] = piece.strip()
+                        if narrative_index or index:
+                            part["indent"] = True
+                        part["centered"] = False
+                        part["signature"] = False
+                        rebuilt.append(part)
+                    if index < len(pieces) - 1:
+                        marker = dict(element)
+                        marker.update({
+                            "text": "***",
+                            "indent": False,
+                            "centered": True,
+                            "signature": True,
+                        })
+                        rebuilt.append(marker)
+        page["elements"] = rebuilt
 
 
 def _structure_and_assemble(cfg: BookConfig, *, pdf_doc, pages, ocr_pages):
@@ -1140,8 +1232,10 @@ def _structure_and_assemble(cfg: BookConfig, *, pdf_doc, pages, ocr_pages):
             op["elements"] = structure_page_vision(
                 pdf_doc[i], op, body_size, heuristics=cfg.book_heuristics,
             )
+    _merge_open_dialogue_paragraphs(ocr_pages)
     _merge_cross_page_paragraphs(ocr_pages)
     pp_registry.run_post_structure(cfg, ocr_pages)
+    _split_embedded_scene_breaks(ocr_pages)
     return assemble_chapters(pages, ocr_pages, pdf_doc, cfg=cfg)
 
 
@@ -1340,10 +1434,12 @@ def _build_book_with_doc(
     # 5b. Cross-page paragraph merge: if page N's last paragraph ends without
     # sentence-final punctuation AND page N+1's first paragraph isn't a
     # heading and starts lowercase / mid-sentence, merge them.
+    _merge_open_dialogue_paragraphs(ocr_pages)
     _merge_cross_page_paragraphs(ocr_pages)
 
     # 6. Per-element post-processors (mojibake cleanup, canonical Quran etc).
     pp_registry.run_post_structure(cfg, ocr_pages)
+    _split_embedded_scene_breaks(ocr_pages)
     ocr_corrections.write_report(cfg)
     correction_count = ocr_corrections.correction_count()
     if correction_count:

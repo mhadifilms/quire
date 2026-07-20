@@ -368,7 +368,7 @@ def test_cross_page_paragraph_merge() -> None:
         {"pno": 1, "elements": [
             {"kind": "paragraph", "text": "First page text continues without punctuation", "y": 100},
         ]},
-        {"pno": 2, "elements": [
+        {"pno": 2, "printed_page": 4, "elements": [
             {"kind": "paragraph", "text": "into the next page nicely.", "y": 50},
         ]},
     ]
@@ -379,6 +379,51 @@ def test_cross_page_paragraph_merge() -> None:
     # Page 2's first paragraph removed.
     assert not any(p["kind"] == "paragraph" and p["text"].startswith("into")
                    for p in pages[1]["elements"])
+    assert pages[0]["elements"][0]["_continuation_pagebreaks"] == [
+        {"offset": 46, "pdf_pno": 2, "printed": 4},
+    ]
+
+
+def test_cross_page_paragraph_merge_after_conjunction_before_proper_noun() -> None:
+    pages = [
+        {"pno": 1, "elements": [
+            {"kind": "paragraph", "text": "The thought continued. And", "y": 100},
+        ]},
+        {"pno": 2, "elements": [
+            {"kind": "paragraph", "text": "Grandma put on her coat.", "y": 50},
+        ]},
+    ]
+
+    pipeline._merge_cross_page_paragraphs(pages)
+
+    assert pages[0]["elements"][0]["text"] == (
+        "The thought continued. And Grandma put on her coat."
+    )
+    assert pages[1]["elements"] == []
+
+
+def test_false_paragraph_split_inside_open_dialogue_is_merged() -> None:
+    pages = [
+        {
+            "elements": [
+                {
+                    "kind": "paragraph",
+                    "text": '"All right," he said. "Tour\'s over.',
+                },
+                {
+                    "kind": "paragraph",
+                    "text": "Don't forget to buy your souvenirs.",
+                },
+            ]
+        }
+    ]
+
+    pipeline._merge_open_dialogue_paragraphs(pages)
+
+    assert len(pages[0]["elements"]) == 1
+    assert pages[0]["elements"][0]["text"].endswith(
+        "Don't forget to buy your souvenirs."
+    )
 
 
 def test_cross_page_paragraph_no_merge_after_period() -> None:

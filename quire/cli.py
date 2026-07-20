@@ -8,6 +8,36 @@ import sys
 from .config import REPO_ROOT, find_book_dir, load_book_config
 
 
+def _cmd_convert(args: argparse.Namespace) -> int:
+    """Auto-detect and convert one or more PDFs without book mappings."""
+    from .auto import convert_pdf, detect_pdf
+
+    failed = 0
+    for source in args.pdf:
+        try:
+            detected = detect_pdf(source)
+            print(
+                f"[quire auto] {detected.source.name}: "
+                f"title={detected.title!r} author={detected.author!r} "
+                f"engine={detected.ocr_engine} start_page={detected.content_start_page}",
+                file=sys.stderr,
+            )
+            outputs = convert_pdf(
+                source,
+                output_dir=args.output_dir,
+                force_ocr=args.force_ocr,
+                audit=not args.no_audit,
+            )
+            print(
+                f"[quire auto] wrote {outputs['markdown']} and {outputs['epub']}",
+                file=sys.stderr,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"[quire auto] failed {source}: {exc}", file=sys.stderr)
+    return 0 if failed == 0 else 1
+
+
 def _cmd_build(args: argparse.Namespace) -> int:
     from .pipeline import build_book
 
@@ -174,6 +204,28 @@ def main(argv: list[str] | None = None) -> int:
         description="Quire — reflowable EPUB pipeline for multi-script PDFs.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_convert = sub.add_parser(
+        "convert",
+        help="Auto-detect PDFs and write matching Markdown + EPUB files.",
+    )
+    p_convert.add_argument("pdf", nargs="+", help="One or more source PDF paths.")
+    p_convert.add_argument(
+        "--output-dir",
+        default=None,
+        help="Destination directory (default: beside each source PDF).",
+    )
+    p_convert.add_argument(
+        "--force-ocr",
+        action="store_true",
+        help="Ignore cached OCR and process scanned pages again.",
+    )
+    p_convert.add_argument(
+        "--no-audit",
+        action="store_true",
+        help="Skip EPUBCheck and the automatic artifact audit.",
+    )
+    p_convert.set_defaults(func=_cmd_convert)
 
     p_build = sub.add_parser("build", help="Build EPUB from a book folder.")
     p_build.add_argument("book", help="Book slug or path to a books/<slug>/ folder.")

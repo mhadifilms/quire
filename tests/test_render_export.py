@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from quire.render.chapters import Chapter
-from quire.render.export import render_html, render_markdown, render_text
+from quire.render.export import (
+    _apply_export_qc,
+    render_html,
+    render_markdown,
+    render_text,
+)
 
 
 class _Cfg:
@@ -51,3 +56,28 @@ def test_render_html_includes_aside() -> None:
     assert "<section" in out
     assert 'class="footnotes"' in out
     assert "Body para." in out
+
+
+def test_export_qc_updates_text_and_removes_empty_chapter() -> None:
+    chapter = _make_chapter()
+    front = Chapter(title="Front Matter", slug="front", page_start=1)
+    front.elements = [
+        {"kind": "paragraph", "text": "OCR noise", "_pdf_pno": 1},
+    ]
+
+    corrected = _apply_export_qc(
+        [front, chapter],
+        {"OCR noise": "", "Body para.": "Corrected body."},
+    )
+
+    assert [item.title for item in corrected] == ["Hello"]
+    assert corrected[0].elements[1]["text"] == "Corrected body."
+
+
+def test_export_qc_applies_generic_typography_repairs() -> None:
+    chapter = _make_chapter()
+    chapter.elements[1]["text"] = "'I like him' Dina said."
+
+    corrected = _apply_export_qc([chapter], {})
+
+    assert corrected[0].elements[1]["text"] == "'I like him.' Dina said."

@@ -360,12 +360,12 @@ def _line_ocr_penalty(text: str) -> int:
         bare = word.replace("’", "'")
         # Mixed case inside a word is almost always OCR damage (``cauTIoN``).
         if (
-            len(bare) >= 4
+            len(bare) >= 3
             and any(c.islower() for c in bare)
             and any(c.isupper() for c in bare[1:])
         ):
             penalty += 3
-        if bare in {"T'll", "T’d", "T'd"}:
+        if bare in {"T'll", "T’d", "T'd", "T've", "Tve", "Td"}:
             penalty += 3
         lower = bare.lower()
         if len(lower) >= 4 and not _is_known_english(lower):
@@ -373,10 +373,63 @@ def _line_ocr_penalty(text: str) -> int:
             if not bare[:1].isupper():
                 penalty += 1
     penalty += sum(text.count(char) for char in "_|~©°")
+    # English prose should not contain isolated OCR-only diacritics or these
+    # recurring short-token confusions. Keep this evidence generic and let the
+    # aligned fallback provide the replacement rather than hard-coding it.
+    penalty += 3 * len(re.findall(r"[äöüÄÖÜ]", text))
+    penalty += 2 * len(re.findall(r"\bot\b", text))
+    penalty += 3 * len(re.findall(r"\bTa\s+better\b", text))
+    penalty += 3 * len(
+        re.findall(r"\b(?:should|could|would|must|might)\s+ve\b", text, re.I)
+    )
+    penalty += 3 * len(
+        re.findall(r"\b(?:wars?|conflicts?)\s+arid\s+(?:famines?|hunger)\b", text, re.I)
+    )
+    penalty += 2 * len(
+        re.findall(r"\b(?:I|you|he|she|we|they|it)\.\s+[a-z]", text)
+    )
+    penalty += 4 * len(re.findall(r"\bI(?:m|d)\b", text))
+    if re.match(r"^\s*\*I\s+[a-z]", text):
+        penalty += 4
+    penalty += 2 * len(re.findall(r"\.\s+\.", text))
+    if re.match(r"^\s*['’][a-z]{2,}\b", text):
+        penalty += 4
     # Opening quote swallowed the closing quote before a dialogue tag.
-    if re.search(r'^["“][^"”]+,\s+(?:he|she|they|[A-Z][a-z]+)\s', text):
+    if re.search(r'^[\'"“‘][^\'"”’]+,\s+(?:he|she|they|[A-Z][a-z]+)\s', text):
         penalty += 3
+    # Dialogue ending immediately before an attribution needs a closing mark.
+    # Conversely, a line ending in a closing mark + attribution normally needs
+    # an opening mark at the start of the spoken words.
+    if re.search(
+        r"^[\'\"“‘].+[,.!?]\s+(?:said|asked|replied|murmured|whispered|"
+        r"he|she|they|[A-Z][a-z]+)\b",
+        text,
+        re.I,
+    ) and not re.search(r"[,.!?][\'\"”’]\s+", text):
+        penalty += 3
+    if re.search(
+        r"^[A-Z].+[,!?][\'’]\s+(?:said|asked|replied|murmured|whispered)\b",
+        text,
+        re.I,
+    ):
+        penalty += 3
+    # Vision sometimes renders a closing curly quote as a question mark,
+    # producing impossible doubled sentence punctuation such as ``.?``.
+    if re.search(r"(?:[.,;:!])[?](?:\s|$)", text):
+        penalty += 3
+    # A bare apostrophe between a lower-case word and a new sentence is
+    # usually a damaged closing quote with its preceding stop omitted.
+    for match in re.finditer(r"\b([A-Za-z]{2,})['’]\s+[A-Z]", text):
+        if not match.group(1).isupper():
+            penalty += 2
     return penalty
+
+
+def _boundary_quote_count(text: str) -> int:
+    """Count quotation marks while ignoring apostrophes inside words."""
+    count = sum(text.count(char) for char in '"“”')
+    count += len(re.findall(r"(?<![A-Za-z])['‘’]|['‘’](?![A-Za-z])", text))
+    return count
 
 
 def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict]:
@@ -393,8 +446,9 @@ def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict
     for line in primary:
         best = None
         best_penalty = _line_ocr_penalty(line.get("text", ""))
+        has_consensus = False
         for cand in candidates:
-            if abs(cand["y0"] - line["y0"]) > 7.5:
+            if abs(cand["y0"] - line["y0"]) > 12:
                 continue
             overlap_x = _y_overlap(line["x0"], line["x1"], cand["x0"], cand["x1"])
             min_width = min(
@@ -403,15 +457,49 @@ def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict
             )
             if overlap_x / min_width < 0.70:
                 continue
+            primary_text = line.get("text", "")
             cand_text = cand.get("text", "")
+            # Tesseract sometimes prefixes a clean continuation with a rule
+            # fragment read as ``_``/``|``. The aligned primary confirms that
+            # the capitalized prose starts immediately.
+            cleaned_cand_text = re.sub(
+                r"^\s*[_|]\s+(?=[A-Z])",
+                "",
+                cand_text,
+            )
+            if cleaned_cand_text != cand_text:
+                cand = dict(cand)
+                cand_text = cleaned_cand_text
+                cand["text"] = cand_text
+            # Recover an oversized drop cap that the fallback omitted while
+            # keeping the fallback's cleaner small-caps words.
+            primary_first = primary_text.split(maxsplit=1)[0] if primary_text else ""
+            drop_cap_repair = False
+            if (
+                len(primary_first) == 3
+                and primary_first[0].isupper()
+                and any(char.islower() for char in primary_first[1:])
+                and cand_text.startswith(primary_first[1:].upper() + " ")
+            ):
+                cand = dict(cand)
+                cand_text = primary_first[0] + cand_text
+                cand["text"] = cand_text
+                drop_cap_repair = True
             similarity = difflib.SequenceMatcher(
                 None,
-                line.get("text", "").lower(),
+                primary_text.lower(),
                 cand_text.lower(),
                 autojunk=False,
             ).ratio()
             if similarity < 0.55:
                 continue
+            # Tightly led lines can overlap vertically. A broad y tolerance is
+            # safe only when the texts strongly agree; otherwise an adjacent
+            # sentence can be selected as the "repair".
+            if abs(cand["y0"] - line["y0"]) > 7.5 and similarity < 0.75:
+                continue
+            if similarity >= 0.65:
+                has_consensus = True
             cand_penalty = _line_ocr_penalty(cand_text)
 
             # Resolve a hyphenated word using the next line as dictionary
@@ -449,17 +537,193 @@ def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict
                         cand_penalty -= 3
 
             conf = _line_conf_percent(cand)
-            if cand_penalty < best_penalty and (conf < 0 or conf >= 85):
+            primary_quote_count = _boundary_quote_count(primary_text)
+            candidate_quote_count = _boundary_quote_count(cand_text)
+            candidate_has_better_quote_boundary = (
+                candidate_quote_count > primary_quote_count
+                and (
+                    candidate_quote_count % 2 == 0
+                    or re.search(r"[.!?,][\"”’]\s+(?:[A-Z]|$)", cand_text) is not None
+                )
+            )
+            primary_words = re.findall(
+                r"[A-Za-z]+(?:['’][A-Za-z]+)?",
+                primary_text.lower(),
+            )
+            candidate_words = re.findall(
+                r"[A-Za-z]+(?:['’][A-Za-z]+)?",
+                cand_text.lower(),
+            )
+            candidate_restores_terminal = (
+                similarity >= 0.82
+                and re.search(r'[.!?]["”’\']?\s*$', primary_text) is None
+                and re.search(r'[.!?]["”’\']?\s*$', cand_text) is not None
+                and primary_words == candidate_words
+            )
+            punctuation_repair = (
+                similarity >= 0.65
+                and (
+                    _line_ocr_penalty(cand_text) < _line_ocr_penalty(primary_text)
+                    or candidate_has_better_quote_boundary
+                    or candidate_restores_terminal
+                )
+                and any(mark in cand_text for mark in ".,’”'“‘")
+            )
+            word_diff = difflib.SequenceMatcher(
+                None, primary_words, candidate_words, autojunk=False
+            )
+            only_safe_insertions = bool(candidate_words) and len(candidate_words) > len(primary_words)
+            inserted = 0
+            for tag, i1, i2, j1, j2 in word_diff.get_opcodes():
+                if tag == "equal":
+                    continue
+                if tag != "insert":
+                    only_safe_insertions = False
+                    break
+                inserted += j2 - j1
+            omission_repair = (
+                similarity >= 0.82
+                and only_safe_insertions
+                and 1 <= inserted <= 3
+                and cand_penalty <= best_penalty
+            )
+            high_confidence_repair = (
+                (cand_penalty < best_penalty or drop_cap_repair)
+                and (conf < 0 or conf >= 85)
+            )
+            aligned_punctuation_repair = (
+                punctuation_repair and (conf < 0 or conf >= 65)
+            )
+            dash_repair = (
+                similarity >= 0.82
+                and re.search(r"[A-Za-z]-[A-Za-z]", primary_text) is not None
+                and "—" in cand_text
+                and (conf < 0 or conf >= 75)
+            )
+            leading_quote_repair = (
+                similarity >= 0.90
+                and re.match(r"^\s*\*[A-Z]", primary_text) is not None
+                and re.match(r'^\s*["“][A-Z]', cand_text) is not None
+                and (conf < 0 or conf >= 85)
+            )
+            if (
+                dash_repair
+                and not re.search(r"[—-]\s*$", primary_text)
+                and re.search(r"\s+[—-]\s*$", cand_text)
+            ):
+                cand = dict(cand)
+                cand_text = re.sub(r"\s+[—-]\s*$", "", cand_text)
+                cand["text"] = cand_text
+            lost_leading_pronoun = (
+                re.search(r"\bI['’](?:ve|d|ll|m)\b", primary_text) is not None
+                and re.search(r"\bI['’](?:ve|d|ll|m)\b", cand_text) is None
+            )
+            high_confidence_omission_repair = (
+                omission_repair and (conf < 0 or conf >= 85)
+            )
+            if (
+                not lost_leading_pronoun
+                and (
+                    high_confidence_repair
+                    or aligned_punctuation_repair
+                    or high_confidence_omission_repair
+                    or dash_repair
+                    or leading_quote_repair
+                )
+            ):
                 best = cand
                 best_penalty = cand_penalty
         if best is None:
-            out.append(line)
+            kept = dict(line)
+            if has_consensus:
+                kept["_ocr_consensus"] = True
+            out.append(kept)
         else:
             replacement = dict(line)
             replacement["text"] = best["text"]
             replacement["conf"] = best.get("conf", line.get("conf", -1))
+            for key in ("x0", "x1", "y0", "y1"):
+                if key in best:
+                    replacement[key] = best[key]
+            replacement["_ocr_consensus"] = True
             out.append(replacement)
-    return out
+    # A second OCR engine can recover an entire line omitted by the primary
+    # engine. Add only high-confidence, prose-like lines that have no aligned
+    # primary counterpart. Header/footer and page-number filters run afterward.
+    for cand in candidates:
+        text = cand.get("text", "").strip()
+        conf = _line_conf_percent(cand)
+        if (conf >= 0 and conf < 85) or len(re.findall(r"[A-Za-z]+", text)) < 3:
+            continue
+        aligned = False
+        for line in primary:
+            y_delta = abs(cand["y0"] - line["y0"])
+            if y_delta > 12:
+                continue
+            overlap_x = _y_overlap(line["x0"], line["x1"], cand["x0"], cand["x1"])
+            min_width = min(
+                max(1.0, line["x1"] - line["x0"]),
+                max(1.0, cand["x1"] - cand["x0"]),
+            )
+            text_similarity = difflib.SequenceMatcher(
+                None,
+                line.get("text", "").casefold(),
+                text.casefold(),
+                autojunk=False,
+            ).ratio()
+            if (
+                overlap_x / min_width >= 0.50
+                and (y_delta <= 7.5 or text_similarity >= 0.45)
+            ):
+                aligned = True
+                break
+        if not aligned:
+            recovered = dict(cand)
+            recovered["_ocr_consensus"] = True
+            out.append(recovered)
+    return sorted(out, key=lambda line: (line["y0"], line["x0"]))
+
+
+def _drop_overlapping_short_hallucinations(lines: list[dict]) -> list[dict]:
+    """Remove tiny OCR fragments drawn on top of a complete prose line.
+
+    Vision occasionally emits both the real line and a 2–4 word hallucination
+    inside the same bounding box. The normal same-baseline merger then splices
+    the fragment into valid prose. A short line is dropped only when a much
+    wider line in the same column contains its horizontal box and substantially
+    overlaps its vertical box.
+    """
+    kept: list[dict] = []
+    for line in lines:
+        words = re.findall(r"[A-Za-z]+", line.get("text", ""))
+        width = max(1.0, line["x1"] - line["x0"])
+        if len(words) > 4 or line.get("_ocr_consensus"):
+            kept.append(line)
+            continue
+        hallucination = False
+        for other in lines:
+            if other is line:
+                continue
+            other_words = re.findall(r"[A-Za-z]+", other.get("text", ""))
+            other_width = max(1.0, other["x1"] - other["x0"])
+            if len(other_words) < len(words) + 3 or other_width < width * 1.8:
+                continue
+            horizontal = _y_overlap(line["x0"], line["x1"], other["x0"], other["x1"])
+            vertical = _y_overlap(line["y0"], line["y1"], other["y0"], other["y1"])
+            line_height = max(1.0, line["y1"] - line["y0"])
+            center_delta = abs(
+                ((line["y0"] + line["y1"]) / 2)
+                - ((other["y0"] + other["y1"]) / 2)
+            )
+            if (
+                horizontal / width >= 0.85
+                and (vertical / line_height >= 0.45 or center_delta <= 7.5)
+            ):
+                hallucination = True
+                break
+        if not hallucination:
+            kept.append(line)
+    return kept
 
 
 def _looks_like_centered_imprint_page(lines: list[dict], page_width: float) -> bool:
@@ -604,7 +868,9 @@ def merge_same_y_lines(lines: list[dict], y_tol: float = 4.0) -> list[dict]:
             merged["y0"] = min(merged["y0"], L["y0"])
             merged["y1"] = max(merged["y1"], L["y1"])
         out.append(merged)
-    out.sort(key=lambda L: L["y0"])
+    # Tall glyphs (drop caps and quotation marks) can make y0 misleading.
+    # Baseline-centre order keeps adjacent printed lines in reading order.
+    out.sort(key=lambda L: (L["y0"] + L["y1"]) / 2)
     return out
 
 
@@ -661,7 +927,20 @@ def detect_spread_columns(
 
     if best is None:
         return None
-    _, left, right, gutter = best
+    _, _, _, gutter = best
+    # Reassign the rare gutter-crossing line by its centre. Candidate testing
+    # permits a tiny number of crossings, but dropping them loses prose when
+    # OCR extends one line a few points into the whitespace.
+    left = [
+        line
+        for line in meaningful
+        if (line["x0"] + line["x1"]) / 2 < gutter
+    ]
+    right = [
+        line
+        for line in meaningful
+        if (line["x0"] + line["x1"]) / 2 >= gutter
+    ]
     return (
         sorted(left, key=lambda line: (line["y0"], line["x0"])),
         sorted(right, key=lambda line: (line["y0"], line["x0"])),
@@ -679,9 +958,76 @@ def _is_bottom_page_number(
     """Return True for a standalone printed page number in the footer."""
     if line["y0"] < page_height * 0.80:
         return False
-    if not re.fullmatch(r"\s*\d{1,4}\s*", line.get("text", "")):
+    if not re.fullmatch(r"\s*\d{1,4}\.?\s*", line.get("text", "")):
         return False
     return column_left <= (line["x0"] + line["x1"]) / 2 <= column_right
+
+
+def _is_running_header(
+    line: dict,
+    page_width: float,
+    page_height: float | None = None,
+) -> bool:
+    """Return True for a short title/author line in the top margin."""
+    if line["y0"] >= 100:
+        return False
+    text = line["text"].strip()
+    if not text:
+        return True
+    if line["y0"] < 70 and re.fullmatch(r"[Il|]{0,2}\d{1,4}", text):
+        return True
+    # Common fiction/book running headers are short title strings centred
+    # over either half of a scanned spread or over a portrait page.
+    if line["y0"] < 70:
+        width = line["x1"] - line["x0"]
+        centre = (line["x0"] + line["x1"]) / 2
+        # A landscape scan is normally a two-page spread. Its body lines near
+        # the gutter must not be mistaken for portrait-page centred headers.
+        centres = (
+            (0.25, 0.75)
+            if page_height is not None and page_width > page_height * 1.12
+            else (0.5,)
+        )
+        near_header_centre = min(
+            abs(centre - page_width * fraction)
+            for fraction in centres
+        ) < page_width * 0.12
+        words = re.findall(r"[A-Za-z]+", text)
+        title_case_ratio = (
+            sum(word[:1].isupper() for word in words) / len(words)
+            if words else 0.0
+        )
+        known_title = normalize_known_title(text) is not None
+        header_core = re.sub(r"\s+[a-z]\s*$", "", text)
+        core_letters = [char for char in header_core if char.isalpha()]
+        if (
+            line["y0"] < 55
+            and width < page_width * 0.45
+            and len(core_letters) >= 4
+            and all(char.isupper() for char in core_letters)
+        ):
+            return True
+        if (
+            width < page_width * 0.35
+            and near_header_centre
+            and len(text) <= 60
+            and (known_title or title_case_ratio >= 0.60)
+        ):
+            return True
+        # A frequent left-page convention puts the printed page number
+        # before an all-caps collection title.
+        leading_number = re.fullmatch(r"\d{1,4}\s+(.+)", text)
+        if leading_number:
+            title = leading_number.group(1)
+            letters = [char for char in title if char.isalpha()]
+            if len(letters) >= 4 and all(char.isupper() for char in letters):
+                return True
+    trailing_number = re.fullmatch(r"(.+?)\s+(\d{1,4})", text)
+    if not trailing_number:
+        return False
+    title = trailing_number.group(1).strip()
+    letters = [char for char in title if char.isalpha()]
+    return len(letters) >= 4 and all(char.isupper() for char in letters)
 
 
 # ---------- footnote marker detection ----------
@@ -1101,6 +1447,20 @@ def vision_lines_to_paragraphs(
             words = text.split()
             if 1 <= len(words) <= 10:
                 is_heading = True
+        elif is_centered_line and len(text) <= 60 and looks_like_real_english(text):
+            # Image-only PDFs have no font-size metadata. A short centred,
+            # title-shaped line without sentence punctuation is still a strong
+            # story/section heading signal.
+            words = re.findall(r"[A-Za-z]+", text)
+            title_case = sum(word[:1].isupper() for word in words)
+            letters = [char for char in text if char.isalpha()]
+            all_caps = bool(letters) and all(char.isupper() for char in letters)
+            if (
+                1 <= len(words) <= 8
+                and not re.search(r"[.!?][\"'’”)]?\s*$", text)
+                and (all_caps or title_case / len(words) >= 0.75)
+            ):
+                is_heading = True
 
         centered_line = (
             L["x0"] > body_left + avg_h * 2.0
@@ -1116,10 +1476,13 @@ def vision_lines_to_paragraphs(
                 or re.fullmatch(r"[A-Z][A-Za-z]+,\s+[A-Z][A-Za-z]+", text.strip())
             )
         )
+        scene_break = bool(re.fullmatch(r"\s*(?:\*\s*){3}", text))
 
         gap = (L["y0"] - prev_y_bottom) if prev_y_bottom is not None else 0
         prev_text = current["texts"][-1] if current and current["texts"] else ""
-        prev_ended_sentence = bool(re.search(r"[\.!?][\"'\)\]]?\s*$", prev_text)) if prev_text else True
+        prev_ended_sentence = bool(
+            re.search(r"[\.!?][\"'”’\)\]]?\s*$", prev_text)
+        ) if prev_text else True
         prev_ends_with_number = bool(re.search(r"\d{1,3}\s*$", prev_text)) if prev_text else False
         cur_starts_capital = bool(re.match(r"\s*[A-Z(\u2018\u2019']", text))
         toc_break = prev_ends_with_number and cur_starts_capital
@@ -1140,6 +1503,7 @@ def vision_lines_to_paragraphs(
             or is_heading
             or (current and current["heading"])
             or signature_line
+            or scene_break
             or (current and current.get("signature"))
             or gap > avg_h * 1.6
             or (indented and prev_ended_sentence)
@@ -1156,8 +1520,12 @@ def vision_lines_to_paragraphs(
                 "heading": is_heading,
                 "size": size,
                 "confs": [c for c in [_line_conf_percent(L)] if c >= 0],
-                "centered": signature_line,
-                "signature": signature_line,
+                "centered": (
+                    signature_line
+                    or scene_break
+                    or (is_heading and is_centered_line)
+                ),
+                "signature": signature_line or scene_break,
             }
         else:
             current["texts"].append(text_with_em)
@@ -1249,7 +1617,31 @@ def _rejoin_hyphenation(text: str) -> str:
             return left + "-" + right
         return joined
 
-    text = re.sub(r"\b([A-Za-z]{2,})-\s+([a-z]{2,})\b", join_or_keep, text)
+    text = re.sub(
+        r"\b([A-Za-z]{2,})-\s+['’]?([a-z]{2,})\b",
+        join_or_keep,
+        text,
+    )
+    # Vision occasionally drops the printed line-end hyphen altogether,
+    # leaving ``sug gested`` or ``Eng lish``. Rejoin only when the combined
+    # form is a dictionary word and at least one fragment is not independently
+    # plausible. Capitalized short splits such as ``Grand ma`` are also safe
+    # when their combined form is known.
+    def join_dropped_hyphen(match: re.Match) -> str:
+        left, right = match.group(1), match.group(2)
+        joined = left + right
+        if not _is_known_english(joined):
+            return match.group(0)
+        fragments_plausible = _is_known_english(left) and _is_known_english(right)
+        if fragments_plausible:
+            return match.group(0)
+        return joined
+
+    text = re.sub(
+        r"\b([A-Za-z]{2,6})\s+([a-z]{2,9})\b",
+        join_dropped_hyphen,
+        text,
+    )
     text = re.sub(
         r"[—–-]{2,}",
         lambda match: "—" if "—" in match.group(0) else match.group(0),
@@ -1597,47 +1989,16 @@ def structure_page_vision(
         en_lines,
         list(vision_page.get("fallback_en_lines", [])),
     )
-    # Drop running headers using centred title geometry or the conventional
-    # all-caps-title + page-number form. Do not blanket-drop top-margin lines:
-    # a scanned spread's right page often begins body prose near y=40.
-    def _is_running_header(L: dict) -> bool:
-        if L["y0"] >= 100:
-            return False
-        t = L["text"].strip()
-        if not t:
-            return True
-        # Common fiction/book running headers are short title strings centred
-        # over either half of a scanned spread, without a page number.
-        if L["y0"] < 70:
-            width = L["x1"] - L["x0"]
-            centre = (L["x0"] + L["x1"]) / 2
-            near_page_centre = min(
-                abs(centre - pw * 0.25),
-                abs(centre - pw * 0.75),
-            ) < pw * 0.12
-            words = re.findall(r"[A-Za-z]+", t)
-            title_case_ratio = (
-                sum(word[:1].isupper() for word in words) / len(words)
-                if words else 0.0
-            )
-            known_title = normalize_known_title(t) is not None
-            if (
-                width < pw * 0.35
-                and near_page_centre
-                and len(t) <= 60
-                and (known_title or title_case_ratio >= 0.60)
-            ):
-                return True
-        m = re.search(r"^(.+?)\s+(\d{1,3})\s*$", t)
-        if not m:
-            return False
-        title = m.group(1).strip()
-        letters = [c for c in title if c.isalpha()]
-        if len(letters) < 4:
-            return False
-        return all(c.isupper() for c in letters)
-
-    en_lines = [L for L in en_lines if not _is_running_header(L)]
+    en_lines = _drop_overlapping_short_hallucinations(en_lines)
+    for line in en_lines:
+        line["text"] = re.sub(
+            r"^\s*[•·]\s*(?=[a-z])",
+            "",
+            line.get("text", ""),
+        )
+    # Do not blanket-drop top-margin lines: a scanned spread's right page
+    # often begins body prose near y=40.
+    en_lines = [L for L in en_lines if not _is_running_header(L, pw, ph)]
 
     # Detect two-page scans before merging same-baseline fragments. Merging
     # across a spread's gutter irreversibly interleaves the printed pages.
@@ -1647,8 +2008,11 @@ def structure_page_vision(
     line_groups: list[list[dict]] = []
     for group in raw_line_groups:
         if group:
-            col_left = min(line["x0"] for line in group)
-            col_right = max(line["x1"] for line in group)
+            if spread:
+                col_left = min(line["x0"] for line in group)
+                col_right = max(line["x1"] for line in group)
+            else:
+                col_left, col_right = 0.0, pw
             group = [
                 line
                 for line in group
@@ -1809,7 +2173,10 @@ def structure_page_vision(
     for p in paragraphs:
         if p.heading:
             level = known_heading_level(p.text)
-            level = 2 if (level == 1 or level is None and p.size >= body_size * 1.4) else 3
+            level = 2 if (
+                level == 1
+                or level is None and (p.size >= body_size * 1.4 or p.centered)
+            ) else 3
             if level is None:
                 level = 3
             elements.append({"kind": "heading", "level": level, "text": p.text, "y": p.y0, "conf": p.conf})

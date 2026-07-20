@@ -160,10 +160,32 @@ class TestStripFootnoteMisreadQuotes:
         assert new == html  # unchanged
         assert n == 0
 
+    def test_keeps_real_closing_quote_after_long_dialogue(self) -> None:
+        spoken = "I make the trash disappear and " + ("very " * 20) + "quietly."
+        html = f'<p>He said, "{spoken}" His laugh echoed.</p>'
+
+        new, n = strip_footnote_misread_quotes(html)
+
+        assert new == html
+        assert n == 0
+
     def test_does_not_strip_random_quotes(self) -> None:
         html = '<p>Word" not a verb</p>'
         new, _ = strip_footnote_misread_quotes(html)
         assert new == html
+
+    def test_restores_missing_stop_before_closing_dialogue_quote(self) -> None:
+        html = "<p>'I like him' Dina said. \"The writing was on the wall' There it was.</p>"
+        new, n = strip_footnote_misread_quotes(html)
+        assert "'I like him.' Dina said." in new
+        assert '"The writing was on the wall.\' There it was.' in new
+        assert n == 2
+
+    def test_keeps_plural_possessive_before_capitalized_noun(self) -> None:
+        html = "<p>The students' Society met today.</p>"
+        new, n = strip_footnote_misread_quotes(html)
+        assert new == html
+        assert n == 0
 
 
 # ---------- apply_qc_fix (HTML-layer substitution) ----------

@@ -99,6 +99,32 @@ def test_assemble_chapters_keeps_cover_page_when_it_is_story_content() -> None:
     assert [element["text"] for element in chapters[0].elements] == ["Story starts here."]
 
 
+def test_auto_detected_book_drops_short_annotation_before_story() -> None:
+    class Cfg:
+        cover_pdf_page = 1
+        raw = {"input": {"cover_is_content": True, "auto_detected": True}}
+
+    configure_known_headings([("Sample Story", 1)])
+    try:
+        chapters = assemble_chapters(
+            [{"printed_page": None}],
+            [{
+                "pno": 1,
+                "elements": [
+                    {"kind": "paragraph", "text": "Handwritten source citation", "y": 20},
+                    {"kind": "heading", "level": 2, "text": "Sample Story", "y": 150},
+                    {"kind": "paragraph", "text": "Story starts here.", "y": 220},
+                ],
+            }],
+            cfg=Cfg(),
+        )
+    finally:
+        configure_known_headings([])
+
+    assert [chapter.title for chapter in chapters] == ["Sample Story"]
+    assert chapters[0].elements[0]["text"] == "Story starts here."
+
+
 def test_render_chapter_emits_xhtml_skeleton() -> None:
     chapter = Chapter(title="Hello", slug="ch-01", page_start=1)
     chapter.elements = [
@@ -113,6 +139,33 @@ def test_render_chapter_emits_xhtml_skeleton() -> None:
     assert "<h1" in xhtml
     assert 'lang="en"' in xhtml
     assert 1 in emitted
+
+
+def test_render_chapter_preserves_pagebreak_inside_merged_paragraph() -> None:
+    chapter = Chapter(title="Hello", slug="ch-01", page_start=1)
+    chapter.elements = [
+        {
+            "kind": "paragraph",
+            "text": "First half second half.",
+            "y": 100,
+            "_pdf_pno": 1,
+            "_printed": 3,
+            "indent": False,
+            "_continuation_pagebreaks": [
+                {"offset": 11, "pdf_pno": 2, "printed": 4},
+            ],
+        },
+    ]
+
+    class Cfg:
+        language = "en"
+
+    xhtml, emitted = render_chapter(chapter, cfg=Cfg())
+
+    assert 'id="page-4"' in xhtml
+    assert "First half " in xhtml
+    assert "second half." in xhtml
+    assert emitted == {3, 4}
 
 
 def test_navigation_omits_empty_page_list() -> None:
