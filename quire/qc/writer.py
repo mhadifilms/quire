@@ -18,6 +18,7 @@ If no auto block exists yet, one is appended at the end of the file.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -175,3 +176,28 @@ def merge_corrections(
         preserved_human=len(human),
         path=path,
     )
+
+
+def merge_scoped_corrections(path: Path, corrections: list[Correction], *, source_hash: str,
+                             preserve_human: bool = True) -> WriteResult:
+    """Write machine proposals with source/page scope; preserve the prior file.
+
+    Human-authored [phrase] rules remain supported as deliberate book-wide
+    overrides. Machine proposals never become global phrase replacements.
+    """
+    existing = _read_existing(path)
+    human = _parse_human_phrases(existing) if preserve_human else {}
+    if existing:
+        archive = path.parent / "qc_fixes.history" / (hashlib.sha256(existing.encode()).hexdigest() + ".toml")
+        atomic_write_text(archive, existing)
+    selected = {(c.page, c.find): c for c in corrections if c.find and c.find not in human}
+    lines = [_AUTO_BLOCK_RE.sub("", existing).rstrip(), "", _AUTO_START]
+    for key in sorted(selected):
+        correction = selected[key]
+        lines.extend(["", "[[correction]]"])
+        for field, value in {"page": correction.page, "find": correction.find, "replace": correction.replace,
+                             "source_sha256": source_hash, "reason": correction.reason}.items():
+            lines.append(f'{field} = "{_escape_toml_double_quoted(value)}"')
+    lines.extend([_AUTO_END, ""])
+    atomic_write_text(path, "\n".join(lines).lstrip())
+    return WriteResult(len(selected), len(selected), len(human), path)

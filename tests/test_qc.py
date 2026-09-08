@@ -387,6 +387,7 @@ def _make_cfg(tmp_path: pathlib.Path, settings) -> Any:
     cfg.book_dir = book_dir
     cfg.slug = "test-book"
     cfg.pdf_path = book_dir / "source.pdf"
+    cfg.pdf_path.write_bytes(b"test source PDF fingerprint")
     return cfg
 
 
@@ -513,7 +514,10 @@ class TestRunner:
             pages_filter={1},
         )
         body = cfg.qc_fixes_path.read_text("utf-8")
-        assert '"Magam" = "Maqam"' in body
+        assert 'find = "Magam"' in body
+        assert 'replace = "Maqam"' in body
+        assert 'page = "pdf-1"' in body
+        assert 'source_sha256 = ' in body
 
 
 # ---------- page text ------------------------------------------------------
@@ -624,3 +628,35 @@ class TestEstimateCost:
         pt = [PageText(pdf_pno=i, printed=None, plain_text="hello " * 100) for i in range(1, 11)]
         _, usd = estimate_cost(pt, model=DEFAULT_MODEL)
         assert usd > 0.0
+
+
+
+def test_machine_qc_never_changes_the_same_phrase_on_another_page(tmp_path):
+    from types import SimpleNamespace
+
+    from quire.qc.scoped import apply_scoped_corrections
+    from quire.qc.writer import merge_scoped_corrections
+    from quire.render.chapters import Chapter
+    from quire.studio.project import file_hash
+    source = tmp_path / "source.pdf"
+    source.write_bytes(b"source snapshot")
+    path = tmp_path / "qc_fixes.toml"
+    path.write_text('[phrase]\n"human" = "approved"\n')
+    merge_scoped_corrections(path, [Correction("Magam", "Maqam", "high", "scan confirms spelling", "12")], source_hash=file_hash(source))
+    chapters = [Chapter("Title", "title", 1, elements=[
+        {"text": "Magam appears here.", "_pdf_pno": 1, "_printed": 12},
+        {"text": "Magam appears here too.", "_pdf_pno": 2, "_printed": 13}])]
+    cfg = SimpleNamespace(qc_fixes_path=path, pdf_path=source, artifact_dir=tmp_path)
+    result, report = apply_scoped_corrections(cfg, chapters)
+    assert result[0].elements[0]["text"] == "Maqam appears here."
+    assert result[0].elements[1]["text"] == "Magam appears here too."
+    assert chapters[0].elements[0]["text"] == "Magam appears here."
+    assert report[0]["state"] == "applied"
+    assert len(list((tmp_path / "qc_fixes.history").glob("*.toml"))) == 1
+    chapters[0].elements[0]["text"] = "Magam and Magam"
+    result, report = apply_scoped_corrections(cfg, chapters)
+    assert result[0].elements[0]["text"] == "Magam and Magam"
+    assert report[0]["state"] == "needs_review"
+    source.write_bytes(b"changed source")
+    _, report = apply_scoped_corrections(cfg, chapters)
+    assert "Source PDF changed" in report[0]["reason"]

@@ -82,7 +82,7 @@ def main() -> int:
     for r in rows:
         cells = [
             f"{r['engine']:>22}",
-            f"{r['english_pct']:>21.2f}%",
+            f"{r['english_pct']:>21.2f}%" if r['english_pct'] is not None else f"{'unavailable':>22}",
             f"{r['english_words']:>22}",
             f"{r['arabic_chars_epub']:>22}",
             f"{r['ocr_arabic_chars_real']:>22}",
@@ -93,8 +93,9 @@ def main() -> int:
 
     a, b = rows[0], rows[1]
     print()
-    print(f"  ENGLISH WORDS Δ:  {b['english_words'] - a['english_words']:+d}   "
-          f"({b['english_pct'] - a['english_pct']:+.2f} pp coverage)")
+    ratio = (f"{b['english_pct'] - a['english_pct']:+.2f} pp text-count ratio"
+             if a['english_pct'] is not None and b['english_pct'] is not None else "reference unavailable")
+    print(f"  ENGLISH WORDS Δ:  {b['english_words'] - a['english_words']:+d}   ({ratio})")
     print(f"  EPUB ARABIC Δ:    {b['arabic_chars_epub'] - a['arabic_chars_epub']:+d}   "
           f"(B = {b['arabic_chars_epub'] / max(a['arabic_chars_epub'], 1) * 100:.1f}% of A)")
     return 0

@@ -31,7 +31,7 @@ from .engine import (
 )
 from .models import Correction, CostInfo, PageText, QCResult
 from .page_images import render_pages_for_qc
-from .writer import merge_corrections
+from .writer import merge_scoped_corrections
 
 
 @dataclass
@@ -371,10 +371,12 @@ def run_qc(
         result.abort_reason = aborted["reason"]
 
     if result.corrections:
-        write_result = merge_corrections(
+        from ..studio.project import file_hash
+        write_result = merge_scoped_corrections(
             cfg.qc_fixes_path,
             result.corrections,
             preserve_human=settings.preserve_human,
+            source_hash=file_hash(cfg.pdf_path),
         )
         result.fixes_written = write_result.written
         log_event(

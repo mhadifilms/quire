@@ -365,7 +365,7 @@ def extract_page(doc: fitz.Document, pno: int) -> dict:
         text = "".join(span.get("text", "") for span in line.get("spans", []))
         compact = re.sub(r"\s+", "", text)
         if re.fullmatch(r"\d{1,4}", compact):
-            printed_page = compact
+            printed_page = int(compact)
             footer_page_idx = idx
             break
 

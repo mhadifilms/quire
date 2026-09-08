@@ -574,7 +574,7 @@ def _prefer_fallback_ocr(primary: list[dict], fallback: list[dict]) -> list[dict
             )
             only_safe_insertions = bool(candidate_words) and len(candidate_words) > len(primary_words)
             inserted = 0
-            for tag, i1, i2, j1, j2 in word_diff.get_opcodes():
+            for tag, _i1, _i2, j1, j2 in word_diff.get_opcodes():
                 if tag == "equal":
                     continue
                 if tag != "insert":

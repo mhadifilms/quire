@@ -1470,6 +1470,11 @@ def _build_book_with_doc(
         # right below. See quire/qc/ for the full implementation.
         _maybe_run_qc(cfg, rendered=rendered, chapters=chapters)
 
+        from .qc.scoped import apply_scoped_corrections
+        chapters, scoped_report = apply_scoped_corrections(cfg, chapters)
+        if any(item["state"] == "applied" for item in scoped_report):
+            rendered = [(c.slug, render_chapter(c, all_chapters=chapters, cfg=cfg)[0]) for c in chapters]
+
         # 9. Post-render typography fixes.
         # These operate on the rendered XHTML, where OCR / typesetting
         # artifacts surface only after footnote refs are inlined:
@@ -1551,6 +1556,9 @@ def _build_book_with_doc(
 
     extra_formats = selected_formats - {"epub"}
     if extra_formats:
+        if "epub" not in selected_formats:
+            from .qc.scoped import apply_scoped_corrections
+            chapters, _scoped_report = apply_scoped_corrections(cfg, chapters)
         log(f"writing export format(s): {', '.join(sorted(extra_formats))}")
         outputs.update(write_exports(cfg, chapters, extra_formats))
         for fmt, path in sorted(outputs.items()):

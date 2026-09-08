@@ -385,8 +385,10 @@ def run_audit(
     if embed_doc is not None:
         embed_doc.close()
 
-    eng_pct = (eng_words / pdf_real) * 100 if pdf_real else 0
-    ar_pct = (ar_chars / ocr_chars_real) * 100 if ocr_chars_real else 0
+    # These are count ratios, not accuracy or completeness measurements.
+    # Missing baselines are unavailable, not zero coverage.
+    eng_pct = (eng_words / pdf_real) * 100 if pdf_real else None
+    ar_pct = (ar_chars / ocr_chars_real) * 100 if ocr_chars_real else None
 
     targets_by_file = {n: _collect_ids_and_links(d)[0] for n, d in files.items()}
     issues = 0
@@ -468,8 +470,9 @@ def run_audit(
         f"PDF English words (text layer):    {pdf_words}",
         f"PDF English words (real, post-filter): {pdf_real}",
         f"OCR Arabic chars (real, blk>=4):   {ocr_chars_real}",
-        f"English coverage: {eng_pct:.1f}%   (target >= 90%)",
-        f"Arabic  coverage: {ar_pct:.1f}%   (target >= 95%)",
+        f"English text-count ratio: {f'{eng_pct:.1f}%' if eng_pct is not None else 'unavailable (no source baseline)'}",
+        f"Arabic text-count ratio: {f'{ar_pct:.1f}%' if ar_pct is not None else 'unavailable (no OCR baseline)'}",
+        "Count ratios do not measure recognition accuracy or prove completeness. Use project-check for review readiness.",
         f"unresolved internal links: {issues}",
         f"suspicious OCR/noteref artifacts: {len(suspicious)}",
         f"quality warnings: {len(quality_warnings)}",
@@ -517,6 +520,8 @@ def run_audit(
         "ocr_arabic_chars_real": ocr_chars_real,
         "english_coverage_pct": eng_pct,
         "arabic_coverage_pct": ar_pct,
+        "metric_semantics": "text-count ratios; not recognition accuracy",
+        "recognition_accuracy": None,
         "unresolved_links": issues,
         "suspicious_count": len(suspicious),
         "warning_count": len(quality_warnings),

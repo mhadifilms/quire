@@ -23,7 +23,7 @@ class Correction:
     to the model. ``replace`` is the proposed substitute (plain text;
     no HTML tags). ``confidence`` reflects the model's stated certainty.
     ``page`` is the printed-page label (or ``pdf-N`` fallback) the
-    correction was discovered on; informational only.
+    correction was discovered on. Machine corrections are bound to this page.
     """
 
     find: str
