@@ -14,6 +14,7 @@ from pathlib import Path
 import fitz
 
 from .config import REPO_ROOT, BookConfig, load_book_config
+from .languages import detect_language, text_quality
 from .pipeline import _ocr_pages_for, build_book
 from .render.audit import run_audit
 from .render.chapters import slugify
@@ -28,6 +29,8 @@ class AutoDetection:
     ocr_engine: str
     fallback_engine: str | None
     content_start_page: int
+    language: str = "en"
+    language_confidence: float = 1.0
 
 
 def _clean_metadata(value: object) -> str:
@@ -62,7 +65,7 @@ def _filename_metadata(path: Path) -> tuple[str, str]:
 
 
 def _normalized_words(text: str) -> str:
-    return " ".join(re.findall(r"[a-z0-9]+", text.lower()))
+    return " ".join(re.findall(r"[^\W_]+", text.lower(), re.UNICODE))
 
 
 def _detect_content_start(texts: list[str], title: str) -> int:
@@ -92,7 +95,7 @@ def _tesseract_available() -> bool:
     return importlib.util.find_spec("pytesseract") is not None and shutil.which("tesseract") is not None
 
 
-def detect_pdf(path: str | Path) -> AutoDetection:
+def detect_pdf(path: str | Path, *, language: str | None = None) -> AutoDetection:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"PDF not found: {source}")
@@ -115,8 +118,25 @@ def detect_pdf(path: str | Path) -> AutoDetection:
         author = filename_author or metadata_author or "Unknown"
         texts = [page.get_text() for page in doc]
 
-    substantial_pages = sum(len(re.findall(r"\b[A-Za-z]{2,}\b", text)) >= 80 for text in texts)
-    word_count = sum(len(re.findall(r"\b[A-Za-z]{2,}\b", text)) for text in texts)
+    detection = detect_language("\n".join(texts)[:20000], hint=language)
+    if detection["language"] == "und" and _tesseract_available():
+        # Probe a few source images when a scan has no usable text layer.
+        import io
+
+        from PIL import Image
+
+        from .studio.extract import _tesseract
+        with fitz.open(source) as doc:
+            for index in range(min(4, len(doc))):
+                image = Image.open(io.BytesIO(doc[index].get_pixmap(dpi=140).tobytes("png")))
+                candidates = _tesseract(image, [])
+                sample = "\n".join(n["text"] for n in candidates if n["confidence"] >= .6)
+                guessed = detect_language(sample)
+                if guessed["confidence"] >= .75:
+                    detection = guessed
+                    break
+    substantial_pages = sum(sum(c.isalpha() for c in text) >= 240 and text_quality(text) >= .65 for text in texts)
+    word_count = sum(sum(c.isalpha() for c in text) / 3 for text in texts)
     reliable_text = bool(texts) and (
         substantial_pages >= max(1, round(len(texts) * 0.45))
         and word_count >= len(texts) * 80
@@ -125,6 +145,8 @@ def detect_pdf(path: str | Path) -> AutoDetection:
         engine = "text"
         fallback = None
         content_start = _detect_content_start(texts, title)
+    elif detection["language"] in {"fa", "ur", "ar"} and _tesseract_available():
+        engine, fallback, content_start = "tesseract", None, 1
     elif _vision_available():
         engine = "vision"
         fallback = "tesseract" if _tesseract_available() else None
@@ -145,6 +167,8 @@ def detect_pdf(path: str | Path) -> AutoDetection:
         ocr_engine=engine,
         fallback_engine=fallback,
         content_start_page=content_start,
+        language=detection["language"],
+        language_confidence=detection["confidence"],
     )
 
 
@@ -182,7 +206,7 @@ def _prepare_workspace(detection: AutoDetection, workspace_root: Path) -> BookCo
         f"slug = {_toml_string(detection.slug)}\n"
         f"title = {_toml_string(detection.title)}\n"
         f"author = {_toml_string(detection.author)}\n"
-        'language = "en"\n\n'
+        f'language = {_toml_string(detection.language)}\n\n'
         "[input]\n"
         'pdf = "source.pdf"\n'
         "cover_pdf_page = 1\n"
@@ -191,7 +215,7 @@ def _prepare_workspace(detection: AutoDetection, workspace_root: Path) -> BookCo
         "[ocr]\n"
         f"engine = {_toml_string(detection.ocr_engine)}\n"
         f"{fallback_line}"
-        'languages = ["en-US"]\n'
+        f'languages = [{_toml_string(detection.language if detection.language != "en" else "en-US")}]\n'
         "workers = 4\n"
         "dpi_scale = 4\n"
         "retries = 1\n\n"
@@ -216,9 +240,12 @@ def convert_pdf(
     workspace_root: str | Path | None = None,
     force_ocr: bool = False,
     audit: bool = True,
+    language: str | None = None,
 ) -> dict[str, Path]:
     """Auto-detect one PDF, build it, validate it, and map final outputs."""
-    detection = detect_pdf(path)
+    detection = detect_pdf(path, language=language)
+    if detection.language == "und":
+        raise ValueError("Language could not be identified; pass --language or use the review workspace import")
     workspace = Path(workspace_root or (REPO_ROOT / "books" / ".auto")).resolve()
     cfg = _prepare_workspace(detection, workspace)
     outputs = build_book(

@@ -15,7 +15,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     failed = 0
     for source in args.pdf:
         try:
-            detected = detect_pdf(source)
+            detected = detect_pdf(source, language=args.language)
             print(
                 f"[quire auto] {detected.source.name}: "
                 f"title={detected.title!r} author={detected.author!r} "
@@ -27,6 +27,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
                 output_dir=args.output_dir,
                 force_ocr=args.force_ocr,
                 audit=not args.no_audit,
+                language=args.language,
             )
             print(
                 f"[quire auto] wrote {outputs['markdown']} and {outputs['epub']}",
@@ -210,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Auto-detect PDFs and write matching Markdown + EPUB files.",
     )
     p_convert.add_argument("pdf", nargs="+", help="One or more source PDF paths.")
+    p_convert.add_argument("--language", help="Source language code; overrides automatic detection.")
     p_convert.add_argument(
         "--output-dir",
         default=None,
@@ -323,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
     p_batch.add_argument("--fail-fast", action="store_true",
                          help="Stop after the first failed book.")
     p_batch.set_defaults(func=_cmd_batch)
+
+    from .studio.cli import register
+    register(sub)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -18,3 +18,5 @@ htmlcov/
 # Local book inputs and generated outputs.
 books/
 artifacts/
+output/
+tmp/

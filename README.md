@@ -1,6 +1,48 @@
 # Quire
 
-Quire is a reflowable-EPUB and multi-format conversion pipeline for image-heavy
+Quire is a local book workspace for importing, reviewing, translating, and
+publishing PDFs. Its visual editor keeps the original scan beside a versioned
+manuscript, so every correction can be traced back to a source region.
+
+## Start the book workspace
+
+```bash
+brew install tesseract tesseract-lang        # macOS
+# Linux: install tesseract-ocr and the language packs your books need
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[studio]"
+quire studio
+```
+
+The browser opens a local library. Import a PDF, check each page's completeness,
+edit and approve its passages, then export an edition. For a prepared project:
+
+```bash
+quire import source.pdf books/workspace/my-book --language auto
+quire review books/workspace/my-book
+quire publish books/workspace/my-book --draft --format pdf --format epub
+```
+
+- Detect languages and route each page between its text layer and OCR.
+- Compare scans and text; recover missed regions, join split paragraphs,
+  repair reading order, edit tables, and connect footnotes.
+- Review aligned translations with chapter context and shared terminology.
+- Export PDF, EPUB, HTML, Markdown, and text from the same saved manuscript.
+- Keep explicit review states, source fingerprints, reversible edits, and
+  portable project bundles.
+
+Automatic translation requires `GEMINI_API_KEY`; manual editing and exchanging
+translation request/response files work without an API key. EPUBCheck and
+DAISY Ace are optional external validators. Missing validators are reported
+as unavailable, and machine extraction never counts as human approval.
+
+See the [workspace guide](docs/book-workspace.md) for the complete workflow,
+translation exchange format, validation, portable backups, and benchmarks.
+
+## Existing configured-book pipeline
+
+Quire also includes a reflowable-EPUB and multi-format conversion pipeline for image-heavy
 or mojibake-laden PDFs, with first-class support for Arabic, Persian, Hebrew,
 Urdu, and other RTL/multi-script content. It is designed to scale from a single
 book to large batches of heterogeneous books in many languages.
@@ -26,7 +68,7 @@ outputs with:
 - Batch processing with bounded parallelism, per-book status manifests, and
   partial-failure isolation.
 - Optional AI-assisted QC via Gemini Vision: compares each page image to
-  its extracted text and merges validated corrections into the book's
+  its extracted text and writes source- and page-scoped corrections into the book's
   `qc_fixes.toml` (see [AI-assisted QC](#ai-assisted-qc-optional)).
 
 ## Layout
@@ -296,8 +338,10 @@ exits non-zero when any book fails (configurable with `--fail-fast` or
 Quire ships an opt-in proofreading stage that compares each rendered page
 image to the extracted page text using a Vision-Language Model (Gemini
 2.5 Flash by default) and proposes corrections. Validated find/replace
-pairs are merged into `<book_dir>/qc_fixes.toml`, which the post-render
-typography stage already applies on the next build.
+pairs are written to `<book_dir>/qc_fixes.toml` with their source fingerprint
+and page label. The next build applies only a unique match on that page and
+records skipped or applied proposals in `qc_scope_report.json`. Human-authored
+`[phrase]` rules retain their explicit book-wide behavior.
 
 ### Setup
 

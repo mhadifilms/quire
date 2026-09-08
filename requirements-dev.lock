@@ -4,14 +4,34 @@
 #
 #    pip-compile --extra=dev --output-file=requirements-dev.lock --strip-extras pyproject.toml
 #
+anyio==4.14.2
+    # via httpx
 ast-serialize==0.3.0
     # via mypy
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
 coverage==7.14.0
     # via pytest-cov
 exceptiongroup==1.3.1
-    # via pytest
+    # via
+    #   anyio
+    #   pytest
+h11==0.16.0
+    # via httpcore
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via quire (pyproject.toml)
+idna==3.19
+    # via
+    #   anyio
+    #   httpx
 iniconfig==2.3.0
     # via pytest
+langdetect==1.0.9
+    # via quire (pyproject.toml)
 librt==0.11.0
     # via mypy
 mypy==2.0.0
@@ -19,11 +39,15 @@ mypy==2.0.0
 mypy-extensions==1.1.0
     # via mypy
 packaging==26.2
-    # via pytest
+    # via
+    #   pytesseract
+    #   pytest
 pathspec==1.1.1
     # via mypy
 pillow==12.2.0
-    # via quire (pyproject.toml)
+    # via
+    #   pytesseract
+    #   quire (pyproject.toml)
 pluggy==1.6.0
     # via
     #   pytest
@@ -34,6 +58,8 @@ pymupdf==1.27.2.3
     # via quire (pyproject.toml)
 pyspellchecker==0.9.0
     # via quire (pyproject.toml)
+pytesseract==0.3.13
+    # via quire (pyproject.toml)
 pytest==9.0.3
     # via
     #   pytest-cov
@@ -42,6 +68,8 @@ pytest-cov==7.1.0
     # via quire (pyproject.toml)
 ruff==0.15.12
     # via quire (pyproject.toml)
+six==1.17.0
+    # via langdetect
 tomli==2.4.1 ; python_version < "3.11"
     # via
     #   coverage
@@ -50,5 +78,6 @@ tomli==2.4.1 ; python_version < "3.11"
     #   quire (pyproject.toml)
 typing-extensions==4.15.0
     # via
+    #   anyio
     #   exceptiongroup
     #   mypy
